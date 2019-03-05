@@ -1,5 +1,8 @@
 # datasets
 datasets/*
+manuscript/supplementary/fulllength_data/*
+annotations/Araport/*
+annotations/AtRTD/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
