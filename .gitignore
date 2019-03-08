@@ -3,6 +3,7 @@ datasets/*
 manuscript/supplementary/fulllength_data/*
 annotations/Araport/*
 annotations/AtRTD/*
+supporting_datasets/Sherstnev2012_Helicos_Bio/*.gz
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

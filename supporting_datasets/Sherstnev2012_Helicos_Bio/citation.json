@@ -1,0 +1,79 @@
+{
+    "source": "PubMed",
+    "accessed": {
+        "date-parts": [
+            [
+                2019,
+                3,
+                8
+            ]
+        ]
+    },
+    "id": "pmid:22820990",
+    "title": "Direct sequencing of Arabidopsis thaliana RNA reveals patterns of cleavage and polyadenylation",
+    "author": [
+        {
+            "family": "Sherstnev",
+            "given": "Alexander"
+        },
+        {
+            "family": "Duc",
+            "given": "Céline"
+        },
+        {
+            "family": "Cole",
+            "given": "Christian"
+        },
+        {
+            "family": "Zacharaki",
+            "given": "Vasiliki"
+        },
+        {
+            "family": "Hornyik",
+            "given": "Csaba"
+        },
+        {
+            "family": "Ozsolak",
+            "given": "Fatih"
+        },
+        {
+            "family": "Milos",
+            "given": "Patrice M"
+        },
+        {
+            "family": "Barton",
+            "given": "Geoffrey J"
+        },
+        {
+            "family": "Simpson",
+            "given": "Gordon G"
+        }
+    ],
+    "container-title-short": "Nat Struct Mol Biol",
+    "container-title": "Nature structural & molecular biology",
+    "ISSN": "1545-9985",
+    "issued": {
+        "date-parts": [
+            [
+                2012,
+                8
+            ]
+        ]
+    },
+    "epub-date": {
+        "date-parts": [
+            [
+                2012,
+                7,
+                22
+            ]
+        ]
+    },
+    "page": "845-52",
+    "volume": "19",
+    "issue": "8",
+    "PMID": "22820990",
+    "PMCID": "PMC3533403",
+    "DOI": "10.1038/nsmb.2345",
+    "type": "article-journal"
+}
