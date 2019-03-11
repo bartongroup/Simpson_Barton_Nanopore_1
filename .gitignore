@@ -1,5 +1,6 @@
 # datasets
 datasets/*
+manuscript/notebooks/*.pkl
 manuscript/supplementary/fulllength_data/*
 annotations/Araport/*
 annotations/AtRTD/*
