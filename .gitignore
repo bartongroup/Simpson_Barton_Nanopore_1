@@ -5,8 +5,13 @@ manuscript/supplementary/fulllength_data/*
 annotations/Araport/*
 annotations/AtRTD/*
 supporting_datasets/Sherstnev2012_Helicos_Bio/*.gz
+error_corrected_datasets/alignments/*
+error_corrected_datasets/splicing
+
 *._*
 *~$*
+*.fasta
+*.fa
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
