@@ -1,0 +1,86 @@
+configfile: "config.yaml"
+
+import os, glob
+
+COMMON_EXPAND_PARAMS = dict(
+    friendly_name=config['friendly_name'],
+    filtered=['passes', 'fails'],
+    bam_types=['', '.bai', 'stats'],
+)
+
+rule all:
+    input:
+        expand(
+            ["raw_data/{friendly_name}.dna.fastq",
+             "raw_data/filtered/{friendly_name}.{filtered}.fq",
+             "aligned_data/{friendly_name}.{filtered}.bam{bam_types}"],
+            **COMMON_EXPAND_PARAMS
+        )
+
+
+rule adapter_detection:
+    input:
+        fastq='raw_data/{friendly_name}.dna.fastq',
+        summaries='summaries',
+        fast5s='fast5s'
+    output:
+        'raw_data/filtered/{friendly_name}.passes.fq',
+        'raw_data/filtered/{friendly_name}.fails.fq'
+    log:
+        'logs/{friendly_name}.adapter_detector.log'
+    params:
+        output_prefix='raw_data/filtered/{friendly_name}'
+    threads: 12
+    shell:
+        '''
+        adapter_detector filter-fastq -c -t 0.9 -p {threads} \
+          -q {input.fastq} \
+          -o {params.output_prefix} \
+          -f {input.fast5s} \
+          -s {input.summaries} > {log}
+        '''
+
+
+rule minimap2_align:
+    input:
+        "raw_data/filtered/{friendly_name}.{filtered}.fq"
+    output:
+        "aligned_data/{friendly_name}.{filtered}.bam"
+    params:
+        reference=config['genome']
+    threads: config["max_threads"]
+    log:
+        "logs/{friendly_name}.{filtered}.minimap2.log"
+    shell:
+        '''
+        minimap2 -t {threads} \
+          -ax splice -k14 -G 50000 -L \
+          --end-bonus 5 \
+          {params.reference} {input} |
+        samtools view -bS - |
+        samtools sort -@ 8 -m 2G - > {output}
+        '''
+
+
+rule index_with_samtools:
+    input:
+        "aligned_data/{friendly_name}.{filtered}.bam"
+    output:
+        "aligned_data/{friendly_name}.{filtered}.bam.bai"
+    log:
+        "logs/{friendly_name}.{filtered}.index.log"
+    threads: 1
+    shell:
+        "samtools index {input}"
+
+
+rule stats_with_samtools:
+    input:
+        "aligned_data/{friendly_name}.{filtered}.bam"
+    output:
+        "aligned_data/{friendly_name}.{filtered}.bamstats"
+    log:
+        "logs/{friendly_name}.{filtered}.stats.log"
+    threads: 1
+    shell:
+        "samtools flagstat {input} > {output}"

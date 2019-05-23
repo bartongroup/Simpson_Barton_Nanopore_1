@@ -1,0 +1,24 @@
+illumina_basedir:
+  /cluster/gjb_lab/cdr/ArabidopsisIllumina_RNAMethylation_expt2/Trimmed
+illumina_sample_names:
+  - 01-Col-0
+  - 02-Col-0
+  - 03-Col-0
+  - 04-Col-0
+  - 05-Col-0
+  - 06-Col-0
+
+nanopore_basedir:
+  /cluster/ggs_lab/mtparker/ONT_guppy_pipeline_runs
+nanopore_sample_names:
+  - 20180201_1617_20180201_FAH45730_WT_Col0_2916_regular_seq
+  - 20180405_FAH59362_WT_Col0_2917
+  - 20180413_1558_20180413_FAH77434_mRNA_WT_Col0_2917
+  - 20180416_1534_20180415_FAH83697_mRNA_WT_Col0_2918
+  - 20180418_1428_20180418_FAH83552_mRNA_WT_Col0_2919
+
+nchunks: 200
+n_illumina_files_per_chunk: 4
+
+genome: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa
+annotation: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.35.gtf

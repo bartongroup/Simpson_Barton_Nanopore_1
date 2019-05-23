@@ -1,0 +1,148 @@
+import os, glob
+
+configfile: 'config.yml'
+
+rule all:
+    input:
+        expand(
+            ['aligned_data/{cond}.merged.bam',
+             'chimeras/{cond}.boot_gp_counts.h5',
+             'chimeras/{cond}.chimeric_reads.bed',
+             'fusion_proteins/cds/{cond}.chimera_putative_orfs.bed',
+             'fusion_proteins/fusions/{cond}.putative_fusion_orfs.bed'],
+            cond=[config['cond_a'], config['cond_b']]
+        ),
+        expand(
+            'chimeras/{comparison}.chimera_log_fold_changes.tsv',
+            comparison=config['comparison']
+        )
+
+
+def get_cond_names(cond):
+    if cond == config['cond_a']:
+        return config['cond_a_sample_names']
+    elif cond == config['cond_b']:
+        return config['cond_b_sample_names']
+    else:
+        raise ValueError('weird cond name')
+
+
+rule merge_conds:
+    input:
+        lambda wc: expand('aligned_data/{sample_name}.bam', sample_name=get_cond_names(wc.cond))
+    output:
+        bam='aligned_data/{cond}.merged.bam',
+        bai='aligned_data/{cond}.merged.bam.bai'
+    threads: 4
+    shell:
+        '''
+        samtools merge -r -@ {threads} {output.bam} {input}
+        samtools index {output.bam}
+        '''
+
+
+rule detect_chimeras:
+    input:
+        'aligned_data/{cond}.merged.bam'
+    output:
+        'chimeras/{cond}.boot_gp_counts.h5',
+        'chimeras/{cond}.chimeric_reads.bed',
+        'chimeras/{cond}.reference_loci.bed.gz'
+    params:
+        prefix=lambda wc: f'chimeras/{wc.cond}',
+        gtf=config['gtf'],
+        blacklist_genes=config['blacklist_genes']
+    threads: 28
+    shell:
+        '''
+        chimerID detect-chimeras \
+          --bam {input} \
+          --blacklisted-genes {params.blacklist_genes} \
+          -g {params.gtf} \
+          -o {params.prefix} \
+          -p {threads} \
+          -n 50 -s 0.75 \
+        '''
+
+
+rule bootstrap_logodds:
+    input:
+        cond_a='chimeras/{cond_a}.boot_gp_counts.h5'.format(cond_a=config['cond_a']),
+        cond_b='chimeras/{cond_b}.boot_gp_counts.h5'.format(cond_b=config['cond_b'])
+    output:
+        'chimeras/{comparison}.chimera_log_fold_changes.tsv'.format(comparison=config['comparison'])
+    params:
+        cond_a=config['cond_a'],
+        cond_b=config['cond_b']
+    shell:
+        '''
+        chimerID bootstrap-logodds \
+          -a {input.cond_a} -b {input.cond_b} \
+          -as {params.cond_a} -bs {params.cond_b} \
+          -o {output}
+        
+        '''
+
+
+rule extract_chimera_seqs:
+    input:
+        'chimeras/{cond}.chimeric_reads.bed'
+    output:
+        'fusion_proteins/mrnas/{cond}.chimera_seqs.bed'
+    params:
+        genome=config['fasta']
+    shell:
+        '''
+        bedtools getfasta -s -split -name \
+          -fi {params.genome} \
+          -bed {input} \
+          -fo {output}
+        '''
+
+
+rule run_orffinder:
+    input:
+        'fusion_proteins/mrnas/{cond}.chimera_seqs.bed'
+    output:
+        'fusion_proteins/cds/{cond}.chimera_putative_orfs.fa'
+    shell:
+        '''
+        scripts/ORFfinder \
+          -in {input} \
+          -n false \
+          -strand plus \
+          -outfmt 1 \
+          -out {output}
+        '''
+
+
+rule map_orfs:
+    input:
+        orfs='fusion_proteins/cds/{cond}.chimera_putative_orfs.fa',
+        chimeras='chimeras/{cond}.chimeric_reads.bed'
+    output:
+        'fusion_proteins/cds/{cond}.chimera_putative_orfs.bed'
+    params:
+        genome=config['fasta']
+    shell:
+        '''
+        minimap2 -ax splice -uf -C5 {params.genome} {input.orfs} > {output}.sam
+        samtools view -b {output}.sam |
+        bedtools bamtobed -bed12 -i stdin |
+        bedtools intersect -u -f 1 -a stdin -b {input.chimeras} > {output}
+        rm {output}.sam
+        '''
+
+
+rule find_fusion_orfs:
+    input:
+        orfs='fusion_proteins/cds/{cond}.chimera_putative_orfs.bed',
+        ref='chimeras/{cond}.reference_loci.bed.gz'
+    output:
+        'fusion_proteins/fusions/{cond}.putative_fusion_orfs.bed'
+    shell:
+        '''
+        bedtools intersect -split -c -a {input.orfs} -b {input.ref} -s |
+        awk '$13 > 1' |
+        cut -f-12 > {output}
+        '''

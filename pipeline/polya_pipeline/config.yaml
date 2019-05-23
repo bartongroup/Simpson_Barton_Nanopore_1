@@ -1,0 +1,17 @@
+#---------------#
+# DATA SETTINGS #
+#---------------#
+data_root: /cluster/gjb_lab/cdr/ON_MinION_datastore
+data_dirs:
+  - 20180912_1424_20180912_vir1_2923_mRNA
+friendly_name: 201902_vir1_2923
+
+#---------------------------#
+# REFERENCE SETTINGS #
+#---------------------------#
+genome: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa
+
+#---------------------------#
+# CLUSTER SETTINGS #
+#---------------------------#
+max_threads: 24

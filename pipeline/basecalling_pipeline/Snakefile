@@ -1,0 +1,380 @@
+configfile: "config.yaml"
+
+import os, glob
+
+
+if config['make_quickload']:
+    include: 'scripts/quickload/quickload.rules'
+
+
+rule all:
+    log:
+        "logs/cleanup_intermediates.log"
+    input:
+        expand(["aligned_data/{refID}/{fn}.bam{suffixlist}",
+                "oversplitting/{refID}/{fn}.oversplitting.tsv"],
+               refID = list(config["genomes"].keys()) +
+                       list(config["transcriptomes"].keys())+
+                       list(config["spikein_reference"].keys()),
+               fn = config["friendly_name"],
+               suffixlist = ["stats",".bai"]) +
+        expand("gene_expression/{refID}/{fn}.genecounts",
+               refID = list(config["genomes"].keys()) +
+                       list(config["spikein_reference"].keys()),
+               fn=config["friendly_name"]) +
+        expand("aligned_data/{refID}/{fn}_{strand}_{end}-prime.bigwig",
+               refID = list(config["genomes"].keys()) +
+                       list(config["transcriptomes"].keys())+
+                       list(config["spikein_reference"].keys()),
+               fn=config["friendly_name"],
+               strand=["fwd","rev"],
+               end=["three","five"]),
+        expand(
+            ["splicing/{referenceID}/{runid}_read_stats.json",
+             "splicing/{referenceID}/{runid}_splice_stats.json"],
+            referenceID=list(config["genomes"].keys()),
+            runid=config["friendly_name"],
+        ),
+        expand("adapter_blast/{refID}/{fn}_five-prime_softclipped_blast_hits.tsv",
+               refID = list(config["genomes"].keys()) +
+                       list(config["transcriptomes"].keys())+
+                       list(config["spikein_reference"].keys()),
+               fn=config["friendly_name"]) if config['detect_adapter'] else [],
+        expand(
+            "tombo_results/{referenceID}/{fn}.{stat_type}.{strand}.bw",
+            stat_type=['coverage', 'statistic'],
+            fn=config['friendly_name'],
+            referenceID=list(config['transcriptomes']),
+            strand=['plus', 'minus'],
+        ) if config.get('run_tombo', False) else [],
+        expand(
+            'xml_files/{refID}/{runid}.xml',
+            refID=list(config["genomes"].keys()) +
+                  list(config["spikein_reference"].keys()),
+            runid=config['friendly_name']
+        ) if config['make_quickload'] else []
+        
+            
+        
+if config.get('run_tombo', False):
+    rule tombo_annotate_raw_with_fastqs:
+        params:
+            droot = config["data_root"]
+        input:
+            "raw_data/{fn}.rna.fastq",
+        output:
+            "logs/{fn}.tombo_reannotate.log"
+        shell:
+            '''
+            tombo preprocess annotate_raw_with_fastqs \
+              --overwrite --basecall-group guppy_basecall \
+              --fast5-basedir {params.droot} --fastq-filenames {input}
+            touch {output}
+            '''
+    
+    rule tombo_resquiggle:
+        params:
+            droot = config["data_root"],
+            transcriptome = lambda wc: config["transcriptomes"][wc.referenceID]
+        input:
+            "logs/{fn}.tombo_reannotate.log"
+        output:
+            "logs/{fn}.{referenceID}.tombo_resquiggle.log"
+        threads: config['max_threads']
+        shell:
+            '''
+            tombo resquiggle --processes {threads} --ignore-read-locks \
+            --rna --basecall-group guppy_basecall \
+            --overwrite --corrected-group {wildcards.referenceID}_corrected \
+            --signal-length-range 0 500000 \
+            {params.droot} {params.transcriptome}
+            touch {output}
+            '''
+
+    rule tombo_de_novo:
+        params:
+            droot = config["data_root"],
+            basename = lambda wc, output: re.sub('.tombo.stats$', '', output[0])
+        input:
+            "logs/{fn}.{referenceID}.tombo_resquiggle.log"
+        output:
+            "tombo_results/{referenceID}/{fn}.tombo.stats"
+        threads: config['max_threads']
+        shell:
+            '''
+            tombo detect_modifications de_novo \
+              --processes {threads} \
+              --rna --corrected-group {wildcards.referenceID}_corrected \
+              --fast5-basedirs {params.droot} \
+              --statistics-file-basename {params.basename}
+            '''
+    
+    rule tombo_wiggle_output:
+        params:
+            droot = config["data_root"],
+            transcriptome = lambda wc: config["transcriptomes"][wc.referenceID],
+            basename = lambda wc, output: re.split('\.(coverage|statistic)', output[0])[0]
+        input:
+            "tombo_results/{referenceID}/{fn}.tombo.stats"
+        output:
+            expand(
+                "tombo_results/{{referenceID}}/{{fn}}.{stat_type}.{{strand}}.{file_type}",
+                zip,
+                stat_type=['coverage', 'statistic'],
+                file_type=['bedgraph', 'wig']
+            )
+        shell:
+            '''
+            tombo text_output browser_files \
+              --fast5-basedirs {params.droot} \
+              --genome-fasta {params.transcriptome} \
+              --statistics-filename {input} \
+              --browser-file-basename {params.basename} \
+              --file-types {wildcards.stat_type} \
+              --corrected-group {wildcards.referenceID}_corrected
+            '''
+
+
+    rule tombo_wig_to_bigwig:
+        params:
+            transcriptome = lambda wc: config["transcriptomes"][wc.referenceID]
+        input:
+            "tombo_results/{referenceID}/{fn}.statistic.{strand}.wig"
+        output:
+            "tombo_results/{referenceID}/{fn}.statistic.{strand}.bw"
+        shell:
+            '''
+            wigToBigWig {input} \
+              <(cut -f-2 {params.transcriptome}.fai) \
+              {output}
+            '''
+
+    rule tombo_bdg_to_bigwig:
+        params:
+            transcriptome = lambda wc: config["transcriptomes"][wc.referenceID]
+        input:
+            "tombo_results/{referenceID}/{fn}.coverage.{strand}.bedgraph"
+        output:
+            "tombo_results/{referenceID}/{fn}.coverage.{strand}.bw"
+        shell:
+            '''
+            LC_COLLATE=C sort -k1,1 -k2,2n {input} | grep -v track > {input}.tmp
+            bedGraphToBigWig {input}.tmp \
+              <(cut -f-2 {params.transcriptome}.fai) \
+              {output}
+            rm {input}.tmp
+            '''
+            
+
+if config['detect_adapter']:
+    rule detect_adapter:
+        input:
+            "aligned_data/{referenceID}/{runid}_five-prime_softclipped.fa"
+        output:
+            db="adapter_blast/{referenceID}/{runid}_five-prime_softclipped.fa",
+            blast_res="adapter_blast/{referenceID}/{runid}_five-prime_softclipped_blast_hits.tsv"
+        shell:
+            """
+            ln -s $(pwd)/{input} {output.db}
+            makeblastdb -in {output.db} -dbtype nucl -input_type fasta -parse_seqids
+            blastn -evalue 10000 -num_alignments 1000000 -dust no -max_hsps 1 -word_size 4 -outfmt 6 \
+              -query 5padaptersequence_dna.fa \
+              -db {output.db} \
+              -out {output.blast_res}
+            """
+
+
+rule estimate_oversplitting:
+    input:
+        bam='aligned_data/{referenceID}/{runid}.bam',
+        ss=glob.glob('rebasecalled/*/sequencing_summary.txt')
+    output:
+        'oversplitting/{referenceID}/{runid}.oversplitting.tsv'
+    params:
+        ss=lambda wc, input: ' -s '.join(input.ss)
+    shell:
+        '''
+        python scripts/estimate_oversplitting.py -b {input.bam} -s {params.ss} -o {output}
+        '''
+            
+
+rule DRS_splicing_details:
+    input:
+        bam='aligned_data/{referenceID}/{runid}.bam',
+        bai='aligned_data/{referenceID}/{runid}.bam.bai'
+    params:
+        gtf = lambda wildcards : config["gtfs"][wildcards.referenceID],
+        reference = lambda wildcards : config["genomes"][wildcards.referenceID],
+        prefix = "splicing/{referenceID}/{runid}_"
+    output:
+        ["splicing/{referenceID}/{runid}_read_stats.json",
+         "splicing/{referenceID}/{runid}_splice_stats.json"]
+    log:
+        "logs/{referenceID}_{runid}_splicingDetails.log"
+    threads: 1
+    shell:
+        "python scripts/DRS_details/DRS_splitCanonicalSpliceReads.py -b {input.bam} -g {params.reference} -l {log} -a {params.gtf} --stripchr --chr_synonyms C:Pt,M:Mt --input_format gtf -p {params.prefix} --pwm --splitreads --spliton annotated,U2"
+            
+
+rule DRS_end_details:
+    input:
+        "aligned_data/{referenceID}/{runid}.bam.bai"
+    params:
+        logfile = "logs/{runid}_{referenceID}_DRS_endDetails.log",
+        prefix = "aligned_data/{referenceID}/{runid}_",
+        inbam = "aligned_data/{referenceID}/{runid}.bam"
+    output:
+        ["aligned_data/{referenceID}/{runid}_fwd_five-prime.bigwig",
+         "aligned_data/{referenceID}/{runid}_fwd_three-prime.bigwig",
+         "aligned_data/{referenceID}/{runid}_rev_five-prime.bigwig",
+         "aligned_data/{referenceID}/{runid}_rev_three-prime.bigwig",
+         "aligned_data/{referenceID}/{runid}_five-prime_softclipped.fa",
+         "aligned_data/{referenceID}/{runid}_three-prime_softclipped.fa"]
+    log:
+        "logs/{runid}_{referenceID}_endDetails.log"
+    threads: 1
+    shell:
+        "python scripts/DRS_details/DRS_getEndDetails.py {params.inbam} -l {params.logfile} -p {params.prefix} -y -g -t -f"
+
+rule featureCounts_gene_expression:
+    input:
+        "aligned_data/{referenceID}/{runid}.bam.bai"
+    output:
+        "gene_expression/{referenceID}/{runid}.genecounts"
+    params:
+        inbam = "aligned_data/{referenceID}/{runid}.bam",
+        gtf = lambda wildcards : config["gtfs"][wildcards.referenceID]
+    log:
+        "logs/{runid}_{referenceID}_genecounts.log"
+    threads: 1
+    shell:
+        "featureCounts -L -t gene -f -s 1 -D 60000 -a {params.gtf} -o {output} {params.inbam}"
+
+rule samtools_indexbam:
+    input:
+        "aligned_data/{referenceID}/{runid}.bam"
+    output:
+        "aligned_data/{referenceID}/{runid}.bam.bai"
+    log:
+        "logs/{runid}_{referenceID}_indexbam.log"
+    threads: 1
+    shell:    
+        "samtools index {input}"
+
+rule samtools_bamstats:
+    input:
+        "aligned_data/{referenceID}/{runid}.bam"
+    output:
+        "aligned_data/{referenceID}/{runid}.bamstats"
+    log:
+        "logs/{runid}_{referenceID}_bamstats.log"
+    threads: 1
+    shell:
+        "samtools flagstat {input} > {output}"
+
+rule samtools_sortbam:
+    input:
+        ".intermediates/{runid}_{referenceID}.bam"
+    output:
+        "aligned_data/{referenceID}/{runid}.bam"
+    threads: config["max_threads"]
+    log:
+        "logs/{runid}_{referenceID}_sortbam.log"
+    shell:    
+        "samtools sort -@ {threads} -T bob -O bam -o {output} {input}"
+
+
+rule samtools_sam2bam:
+    input:
+        ".intermediates/{runid}_{referenceID}.sam"
+    output:
+        ".intermediates/{runid}_{referenceID}.bam"
+    threads: config["max_threads"]
+    log:
+        "logs/{runid}_{referenceID}_sam2bam.log"
+    shell:    
+        "samtools view -@ {threads} -o {output} -b -h {input}"
+
+rule minimap2_align:
+    input:
+        "raw_data/{runid}.dna.fastq"
+    output:
+        ".intermediates/{runid}_{referenceID}.sam"
+    params:
+        reference = lambda wildcards : config["genomes"][wildcards.referenceID] if wildcards.referenceID in config["genomes"].keys() else (config["transcriptomes"][wildcards.referenceID] if wildcards.referenceID in config["transcriptomes"].keys() else config["spikein_reference"][wildcards.referenceID])
+    threads: config["max_threads"]
+    log:
+        "logs/{runid}_{referenceID}_minimap2.log"
+    shell:
+        "scripts/minimap2-2.8_x64-linux/minimap2 -t {threads} -ax splice -k14 -G 10000 -L --cs {params.reference} {input} > {output}"
+
+
+rule seqkit_U2T:
+    input:
+        "raw_data/{fn}.rna.fastq".format(fn=config["friendly_name"])
+    output:
+        "raw_data/{fn}.dna.fastq".format(fn=config["friendly_name"])
+    log:
+        "logs/{fn}_U2T.log".format(fn=config["friendly_name"])
+    threads: 1
+    shell:
+        "seqkit seq --rna2dna -o {output} {input}"
+
+rule cat_fastqs:
+    input:
+        ".intermediates/{fn}".format(fn=config['friendly_name'])
+    output:
+        "raw_data/{fn}.rna.fastq".format(fn=config["friendly_name"])
+    log:
+        "logs/{fn}_cat_fastqs.log".format(fn=config["friendly_name"])
+    threads: 1
+    shell:
+        '''
+        for FASTQ in {input}/*.fastq; 
+        do
+          cat $FASTQ >> {output}
+        done
+        '''
+
+if config["rebasecall"]:
+    rule guppy_rebasecall:
+        params:
+            droot = config["data_root"],
+            flowcell = config['flowcell'],
+            kit = config['kit'],
+        output:
+            ".intermediates/{fn}".format(fn=config['friendly_name'])
+        log:
+            "logs/{fn}_guppy_2.3.1_rebasecalling.log".format(fn=config['friendly_name'])
+        threads: config["max_threads"]
+        shell:
+            '''
+            scripts/ont-guppy-cpu/bin/guppy_basecaller \
+              --recursive \
+              --flowcell {params.flowcell} \
+              --kit {params.kit} \
+              --num_callers {threads} \
+              --cpu_threads_per_caller 1 \
+              --verbose_logs \
+              --records_per_fastq 0 \
+              --reverse_sequence yes \
+              --input_path {params.droot} \
+              --save_path {output} \
+           '''
+            
+
+else:
+    rule poretools_extract_fastq:
+        params:
+            droot = "{droot}".format(droot=config["data_root"]),
+            indd = "{ddir}"
+        output:
+            ".intermediates/{ddir}.fastq"
+        conda:
+            "envs/poretools.yml"
+        log:
+            "logs/{ddir}_poretools.log"
+        threads: 1
+        shell:
+            "scripts/poretools fastq --type all {params.droot}/{params.indd} > {output}"
+        

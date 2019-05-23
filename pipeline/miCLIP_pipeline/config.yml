@@ -1,0 +1,26 @@
+#---------------------------#
+# REFERENCE SETTINGS #
+#---------------------------#
+
+fasta: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa
+gtf: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_GFF3_genes_transposons.201606.no_chr.gtf
+
+
+#---------------------------#
+# BARCODE #
+#---------------------------#
+
+barcode_pat: NNNXXXXNN
+barcode_fn: adapters/barcodes.tsv
+adapters_fn: adapters/adapters.fa
+
+#---------------------------#
+# RNASeq Data for Piranha 	#
+#---------------------------#
+
+rnaseq_aligned_sample_name: col0_Sample_01-Col-0
+
+#---------------------------#
+# CLUSTER SETTINGS #
+#---------------------------#
+max_threads: 24

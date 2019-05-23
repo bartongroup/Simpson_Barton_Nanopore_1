@@ -1,0 +1,539 @@
+import os, glob
+import itertools as it
+from functools import reduce
+
+import pandas as pd
+
+# Pipeline for end to end analysis of miCLIP ddata
+# This has become a bit convoluted since the
+
+def basename(fn):
+    base_with_ext = os.path.split(fn)[1]
+    base = os.path.splitext(base_with_ext)[0]
+    return base
+
+
+configfile: 'config.yml'
+
+MICLIP_RAW_FILES = glob.glob('raw_data/miCLIP_expt*.fastq.gz')
+INPUT_RAW_FILES = glob.glob('raw_data/miCLIP_input*.fastq.gz')
+MICLIP_SAMPLE_NAMES = [os.path.split(re.sub('.fastq.gz$', '', fn))[1] for fn in MICLIP_RAW_FILES]
+INPUT_SAMPLE_NAMES = [os.path.split(re.sub('.fastq.gz$', '', fn))[1] for fn in INPUT_RAW_FILES]
+POOLED_INPUT_SAMPLE_NAMES, INPUT_LANE_NUMBERS = zip(*[
+    re.search('^(miCLIP_input.*)_L00(\d)', sn).groups() for sn in INPUT_SAMPLE_NAMES
+])
+INPUT_LANE_NUMBERS = sorted(list(set(INPUT_LANE_NUMBERS)))
+POOLED_INPUT_SAMPLE_NAMES = sorted(list(set(POOLED_INPUT_SAMPLE_NAMES)))
+
+BARCODES = {}
+BARCODE_SAMPLE_NAMES = []
+EXPANDED_SAMPLE_NAMES = []
+with open(config['barcode_fn']) as f:
+    for record in f:
+        bc_id, bc, sample_name, replicate = record.split()
+        EXPANDED_SAMPLE_NAMES.append(sample_name)
+        barcode_sample_name = f'{bc_id}_{replicate}'
+        BARCODE_SAMPLE_NAMES.append(barcode_sample_name)
+        BARCODES[barcode_sample_name] = bc
+
+EXPANDED_SAMPLE_BARCODE_NAMES = [f'{sn}.{bn}' for sn, bn in zip(EXPANDED_SAMPLE_NAMES, BARCODE_SAMPLE_NAMES)]
+TREAT_ONLY = [x for x in EXPANDED_SAMPLE_BARCODE_NAMES if not 'noAb' in x]
+
+COMMON_EXPAND_KWARGS = {
+    'all_sample_name_including_input': MICLIP_SAMPLE_NAMES + INPUT_SAMPLE_NAMES,
+    'sample_name': MICLIP_SAMPLE_NAMES,
+    'pooled_input_sample_name': POOLED_INPUT_SAMPLE_NAMES,
+    'expanded_sample_name': EXPANDED_SAMPLE_BARCODE_NAMES,
+    'bam_level': ['sorted', 'deduped'],
+    'bam_suffixes': ['', 'stats', '.bai'],
+    'strand': ['fwd', 'rev'],
+    'end': ['five', 'three']
+}
+
+
+rule all:
+    input:
+        expand(
+            ['qc/pre/{all_sample_name_including_input}_fastqc.zip',
+             'qc/pre/preprocessing_multiqc_report.html',
+             'raw_data/umi_extracted/{sample_name}.fastq.gz',
+             'raw_data/demultiplexed/{pooled_input_sample_name}.fastq.gz',
+             'qc/post/{expanded_sample_name}_fastqc.zip',
+             'aligned_data/{expanded_sample_name}/Aligned.{bam_level}.bam{bam_suffixes}',
+             'aligned_data/{pooled_input_sample_name}/Aligned.sorted.bam{bam_suffixes}',
+             'post_aligned_data/{expanded_sample_name}_{strand}_{end}-prime.bigwig',
+             'motif_detection/{expanded_sample_name}.meme',
+             'post_aligned_data/miCLIP_expt_pooled_{strand}_{end}-prime.bigwig'],
+            **COMMON_EXPAND_KWARGS),
+        'peaks/final/iCLIP_peaks.bed',
+        'xml_files/miCLIP.xml',
+
+
+rule pre_preprocessing_qc:
+    '''run QC with FastQC before trimming/UMI extraction'''
+    input:
+        'raw_data/{sample_name}.fastq.gz',
+    output:
+        'qc/pre/{sample_name}_fastqc.zip',
+        'qc/pre/{sample_name}_fastqc.html'
+    log:
+        'logs/{sample_name}.fastqc_pre.log'
+    threads: 1
+    shell:
+        'fastqc -t 4 -o qc/pre/ {input} &> {log}'
+
+
+rule preprocessing_multiqc:
+    input:
+        expand(
+            'qc/pre/{sample_name}_fastqc.html',
+            sample_name=MICLIP_SAMPLE_NAMES + INPUT_SAMPLE_NAMES
+        )
+    output:
+        'qc/pre/preprocessing_multiqc_report.html'
+    log:
+        'logs/preprocessing_multiqc.log'
+    params:
+        prefix=lambda wc, output: os.path.split(output[0])[0]
+    shell:
+        '''
+        multiqc -f -o {params.prefix} -i preprocessing {params.prefix}
+        '''
+
+
+rule trim_adaptors_with_cutadapt:
+    '''trims adapters! (with cutadapt)'''
+    input:
+        'raw_data/{sample_name}.fastq.gz',
+    output:
+        'raw_data/trimmed/{sample_name}.fastq.gz',
+    log:
+        'logs/{sample_name}.cutadapt.log',        
+    params:
+        adapters_fn=config['adapters_fn'],
+        polya='A' * 100
+    threads: 4
+    shell:
+        'cutadapt -j 0 -a file:{params.adapters_fn} -a {params.polya} -m 40 -o {output} {input} &> {log}'
+
+
+rule extract_umis_with_umi_tools:
+    '''extract the Unique Molecular Identifiers from the fastq with umi_tools'''
+    input:
+        'raw_data/trimmed/{sample_name}.fastq.gz'
+    output:
+        'raw_data/umi_extracted/{sample_name}.fastq.gz'
+    log:
+        'logs/{sample_name}.umi_extract.log'
+    params:
+        barcode=config['barcode_pat']
+    threads: 1
+    shell:
+        '''
+        zcat {input} |
+        umi_tools extract -p {params.barcode} -L {log} |
+        gzip > {output}
+        '''
+
+rule demultiplex_with_seqkit:
+    input:
+        'raw_data/umi_extracted/{sample_name}.fastq.gz'
+    output:
+        'raw_data/demultiplexed/{sample_name}.{barcode_sample_name}.fastq.gz',
+    log:
+        'logs/{sample_name}.{barcode_sample_name}.demultiplex.log'
+    params:
+        barcode_seq=lambda wildcards: BARCODES[wildcards.barcode_sample_name],
+        barcode_len=lambda wildcards: len(BARCODES[wildcards.barcode_sample_name]),
+        barcode_trim=lambda wildcards: len(BARCODES[wildcards.barcode_sample_name]) + 1
+    shell: 
+       '''
+       seqkit grep -s -R 1:{params.barcode_len} -p {params.barcode_seq} {input} |
+       seqkit subseq -r {params.barcode_trim}:-1 |
+       gzip > {output}
+       '''
+
+rule post_preprocessing_qc:
+    '''run QC with FastQC before trimming/UMI extraction'''
+    input:
+        'raw_data/demultiplexed/{sample_name}.{barcode_sample_name}.fastq.gz',
+    output:
+        'qc/post/{sample_name}.{barcode_sample_name}_fastqc.zip',
+        'qc/post/{sample_name}.{barcode_sample_name}_fastqc.html'
+    log:
+        'logs/{sample_name}.{barcode_sample_name}.fastqc_post.log'
+    threads: 1
+    shell:
+        'fastqc -t 4 -o qc/post/ {input} &> {log}'
+
+
+rule pool_input_lanes:
+    input:
+        expand('raw_data/{{sample_name}}_L00{lane}_R1.fastq.gz', lane=INPUT_LANE_NUMBERS)
+    output:
+        'raw_data/demultiplexed/{sample_name}.fastq.gz'
+    shell:
+        '''
+        cat {input} > {output}
+        '''
+
+
+rule build_STAR_index:
+    '''Create the index required for alignment with STAR'''
+    output:
+        directory('STAR_index')
+    log:
+        'logs/STAR_idx.log'
+    threads: 24
+    params:
+        fasta_fn = config['fasta'],
+        gtf_fn = config['gtf'],
+        overhang = 99
+    shell:
+        '''
+        mkdir {output};
+        STAR \
+          --runThreadN {threads} \
+          --runMode genomeGenerate \
+          --genomeDir {output} \
+          --genomeFastaFiles {params.fasta_fn} \
+          --sjdbGTFfile {params.gtf_fn} \
+          --sjdbOverhang {params.overhang}
+        '''
+
+
+rule map_with_STAR:
+    '''map reads with STAR spliced aligner'''
+    input:
+        reads='raw_data/demultiplexed/{sample_name}.fastq.gz',
+        index='STAR_index'
+    output:
+        'aligned_data/{sample_name}/Aligned.out.bam'
+    log:
+        'logs/{sample_name}.star_alignment.log'
+    threads: 24
+    shell:
+        '''
+        ROOTDIR=$(pwd) ;
+        cd aligned_data/{wildcards.sample_name} ;
+        STAR \
+          --runThreadN {threads} \
+          --genomeDir $ROOTDIR/{input.index} \
+          --readFilesIn $ROOTDIR/{input.reads} \
+          --readFilesCommand "zcat" \
+          --outFilterMultimapNmax 5 \
+          --alignSJoverhangMin 8 \
+          --alignSJDBoverhangMin 3 \
+          --outFilterMismatchNmax 5 \
+          --alignIntronMin 60 \
+          --alignIntronMax 10000 \
+          --outSAMtype BAM Unsorted
+        '''
+
+rule sort_with_samtools:
+    input:
+        "aligned_data/{sample_name}/Aligned.out.bam"
+    output:
+        "aligned_data/{sample_name}/Aligned.sorted.bam"
+    log:
+        "logs/{sample_name}.bam_index.log"
+    threads: 8
+    shell:
+        "samtools sort -m 2G -@ {threads} -o {output} {input}"
+        
+
+rule index_with_samtools:
+    input:
+        "aligned_data/{sample_name}/{bam_name}.bam"
+    output:
+        "aligned_data/{sample_name}/{bam_name}.bam.bai"
+    log:
+        "logs/{sample_name}.{bam_name}.bam_index.log"
+    threads: 1
+    shell:
+        "samtools index {input}"
+
+
+rule stats_with_samtools:
+    input:
+        "aligned_data/{sample_name}/{bam_name}.bam"
+    output:
+        "aligned_data/{sample_name}/{bam_name}.bamstats"
+    log:
+        "logs/{sample_name}.{bam_name}.bamstats.log"
+    threads: 1
+    shell:
+        "samtools flagstat {input} > {output}"
+
+
+rule dedup_with_umi_tools:
+    '''Use the UMIs to remove PCR/Optical duplicates with umi_tools'''
+    input:
+        bam="aligned_data/{sample_name}.{barcode_sample_name}/Aligned.sorted.bam",
+        bai="aligned_data/{sample_name}.{barcode_sample_name}/Aligned.sorted.bam.bai",
+    output:
+        "aligned_data/{sample_name}.{barcode_sample_name}/Aligned.deduped.bam",
+    log:
+        "logs/{sample_name}.{barcode_sample_name}.umi_tools_dedup.log"
+    params:
+        stats_prefix="aligned_data/{sample_name}.{barcode_sample_name}/deduplication"
+    threads: 1
+    shell:
+        '''
+        umi_tools dedup -I {input.bam} --spliced-is-unique --output-stats {params.stats_prefix} -S {output} -L {log}
+        '''
+
+
+rule get_softclipped_fasta_and_end_bigwigs:
+    '''Use Nick's DRS script to create bigwigs and softclipped ends'''
+    input:
+        bam="aligned_data/{expanded_sample_name}/Aligned.deduped.bam",
+        bai="aligned_data/{expanded_sample_name}/Aligned.deduped.bam.bai"
+    params:
+        prefix = "post_aligned_data/{expanded_sample_name}_"
+    output:
+        ["post_aligned_data/{expanded_sample_name}_fwd_five-prime.bigwig",
+         "post_aligned_data/{expanded_sample_name}_fwd_three-prime.bigwig",
+         "post_aligned_data/{expanded_sample_name}_rev_five-prime.bigwig",
+         "post_aligned_data/{expanded_sample_name}_rev_three-prime.bigwig",
+         "post_aligned_data/{expanded_sample_name}_five-prime_softclipped.fa",
+         "post_aligned_data/{expanded_sample_name}_three-prime_softclipped.fa"]
+    log:
+        "logs/{expanded_sample_name}.end_bigwigs.log"
+    threads: 1
+    shell:
+        "python scripts/DRS_getEndDetails.py {input.bam} -l {log} -p {params.prefix} -y -g -t -f"
+
+
+rule iclip_coverage:
+    '''bedtools coverage of iCLIP data'''
+    input:
+        'aligned_data/{expanded_sample_name}/Aligned.deduped.bam'
+    output:
+        'post_aligned_data/{expanded_sample_name}.5genomecov.bed'
+    log:
+        'logs/{expanded_sample_name}.5genomecov.log'
+    threads: 1
+    shell:
+        '''
+        bedtools genomecov -5 -dz -strand + -ibam {input} |
+        awk -v OFS='\t' '{{print $1, $2, $2+1, "miCLIP_cov", $3, "+"}}' \
+        > post_aligned_data/{wildcards.expanded_sample_name}.5fwd_genomecov.bed
+
+        bedtools genomecov -5 -dz -strand - -ibam {input} |
+        awk -v OFS='\t' '{{print $1, $2, $2+1, "miCLIP_cov", $3, "-"}}' \
+        > post_aligned_data/{wildcards.expanded_sample_name}.5rev_genomecov.bed
+
+        cat \
+          post_aligned_data/{wildcards.expanded_sample_name}.5fwd_genomecov.bed \
+          post_aligned_data/{wildcards.expanded_sample_name}.5rev_genomecov.bed |
+        sort -k1,1 -k2,2n > {output}
+        '''
+
+
+rule input_coverage:
+    '''bedtools coverage of input data'''
+    input:
+        'aligned_data/{pooled_input_sample_name}/Aligned.sorted.bam'
+    output:
+        'post_aligned_data/{pooled_input_sample_name}.input.5genomecov.bed'
+    log:
+        'logs/{pooled_input_sample_name}.5genomecov.log'
+    threads: 1
+    shell:
+        '''
+        bedtools genomecov -5 -dz -strand + -ibam {input} |
+        awk -v OFS='\t' '{{print $1, $2, $2+1, "input_cov", $3, "+"}}' \
+        > post_aligned_data/{wildcards.pooled_input_sample_name}.input.5fwd_genomecov.bed
+
+        bedtools genomecov -5 -dz -strand - -ibam {input} |
+        awk -v OFS='\t' '{{print $1, $2, $2+1, "input_cov", $3, "-"}}' \
+        > post_aligned_data/{wildcards.pooled_input_sample_name}.input.5rev_genomecov.bed
+
+        cat \
+          post_aligned_data/{wildcards.pooled_input_sample_name}.input.5fwd_genomecov.bed \
+          post_aligned_data/{wildcards.pooled_input_sample_name}.input.5rev_genomecov.bed |
+        sort -k1,1 -k2,2n > {output}
+        '''
+
+
+def get_input_for_clip_data(expanded_sample_name):
+    if expanded_sample_name == 'miCLIP_expt_pooled':
+        input_fn = 'post_aligned_data/miCLIP_input_pooled.input.5genomecov.bed'
+    else:
+        barcode_name = expanded_sample_name.split('.')[1]
+        sample_num = barcode_name.split('_')[-1]
+        input_sample_name = [sn for sn in POOLED_INPUT_SAMPLE_NAMES
+                             if sn.startswith(f'miCLIP_input{sample_num}')]
+        assert len(input_sample_name) == 1, str(input_sample_name)
+        input_sample_name = input_sample_name[0]
+        input_fn = f'post_aligned_data/{input_sample_name}.input.5genomecov.bed'
+    return input_fn
+
+
+rule map_input_to_iclip:
+    input:
+        iclip='post_aligned_data/{expanded_sample_name}.5genomecov.bed',
+        cntrl=lambda wc: get_input_for_clip_data(wc.expanded_sample_name)
+    output:
+        'post_aligned_data/{expanded_sample_name}.iclip_matched_input_5cov.bed'
+    log:
+        'logs/{expanded_sample_name}.iclip_matched_input_5cov.log'
+    shell:
+        '''
+        bedtools map -s -o collapse -a {input.iclip} -b {input.cntrl} |
+        sed -e 's/\./0/' |
+        awk -v OFS='\t' '{{print $1, $2, $3, "rnaseq_cov", $7, $6}}' > {output}
+        '''
+
+
+rule iclip_sig_testing_piranha:
+    '''run piranha to identify iCLIP peaks'''
+    input:
+        iclip='post_aligned_data/{expanded_sample_name}.5genomecov.bed',
+        cntrl='post_aligned_data/{expanded_sample_name}.iclip_matched_input_5cov.bed', 
+    output:
+        'peaks/initial/{expanded_sample_name}.peaks.bed'
+    log:
+        'logs/{expanded_sample_name}.5piranha.log'
+    threads: 1
+    shell:
+        '''
+        Piranha -s -o {output} -p 0.5 -u 0 -c {input.iclip} {input.cntrl}
+        awk -v OFS='\\t' '{{print $1, $2, $3, "peak", $7, $6, $5, $7, $7, $2, "0", "0"}}' \
+          {output} > {output}.tmp
+        mv {output}.tmp {output}
+        '''
+
+
+rule run_idr:
+    input:
+        sample_a='peaks/initial/{sample_a}.peaks.bed',
+        sample_b='peaks/initial/{sample_b}.peaks.bed',
+    output:
+        'peaks/idr/{sample_a}_vs_{sample_b}.peaks.bed'
+    threads: 1
+    shell:
+        '''
+        idr --samples {input.sample_a} {input.sample_b} \
+          --input-file-type bed --rank 5 --peak-merge-method min \
+          -o {output}
+        '''
+
+rule pool_reads:
+    input:
+        expand(
+            'aligned_data/{expanded_sample_name}/Aligned.deduped.bam',
+            expanded_sample_name=TREAT_ONLY
+        )
+    output:
+        bam='aligned_data/miCLIP_expt_pooled/Aligned.deduped.bam',
+        bai='aligned_data/miCLIP_expt_pooled/Aligned.deduped.bam.bai'
+    threads: 1
+    shell:
+        '''
+        samtools merge -r {output.bam} {input}
+        samtools index {output.bam}
+        '''
+
+
+rule pool_input:
+    input:
+        expand(
+            'aligned_data/{expanded_sample_name}/Aligned.sorted.bam',
+            expanded_sample_name=POOLED_INPUT_SAMPLE_NAMES
+        )
+    output:
+        bam='aligned_data/miCLIP_input_pooled/Aligned.sorted.bam',
+        bai='aligned_data/miCLIP_input_pooled/Aligned.sorted.bam.bai'
+    threads: 1
+    shell:
+        '''
+        samtools merge -r {output.bam} {input}
+        samtools index {output.bam}
+        '''
+
+
+rule toppeaks:
+    input:
+        oracle='peaks/initial/miCLIP_expt_pooled.peaks.bed',
+        idr=[f'peaks/idr/{samp_a}_vs_{samp_b}.peaks.bed'
+             for samp_a, samp_b in it.combinations(TREAT_ONLY, r=2)]
+    output:
+        count='peaks/final/iCLIP_peak.count',
+        peaks='peaks/final/iCLIP_peaks.bed'
+    threads: 1
+    shell:
+        '''
+        set +o pipefail # not sure what the command causing this requirement is but the output appears corrects
+        MINPEAKS=$(wc -l {input.idr} | grep -v total | awk '{{print $1}}' | sort -k1,1n | head -n1)
+        echo "using top $MINPEAKS peaks" > {output.count}
+        sort -k5,5g {input.oracle} | head -n $MINPEAKS | sort -k1,1 -k2,2n > {output.peaks}
+        '''
+
+
+rule detect_motifs_with_meme:
+    '''Find motifs de novo using MEME'''
+    input:
+        'peaks/initial/{sample_name}.{barcode_sample_name}.peaks.bed'
+    output:
+        directory('motif_detection/{sample_name}.{barcode_sample_name}.meme')
+    log:
+        'logs/{sample_name}.{barcode_sample_name}.meme.log'
+    threads: 1
+    params:
+        fasta = config['fasta'],
+        fai = '{}.fai'.format(config['fasta'])
+    shell:
+        '''
+        bedtools slop -b 25 -i {input} -g <(cut -f1-2 {params.fai}) \
+        > motif_detection/{wildcards.sample_name}.{wildcards.barcode_sample_name}.slop.bed
+        bedtools getfasta -s \
+          -fi {params.fasta} \
+          -fo motif_detection/{wildcards.sample_name}.{wildcards.barcode_sample_name}.slop.fa \
+          -bed motif_detection/{wildcards.sample_name}.{wildcards.barcode_sample_name}.slop.bed
+        meme -oc {output} -dna -nmotifs 4 -minw 5 -maxw 8 -mod zoops \
+          motif_detection/{wildcards.sample_name}.{wildcards.barcode_sample_name}.slop.fa
+        '''
+
+
+rule end_coverage_xml:
+    input:
+        'post_aligned_data/{sample_name}.{barcode_sample_name}_{strand}_{end}-prime.bigwig'
+    output:
+        'xml_files/individual/{sample_name}.{barcode_sample_name}_{strand}_{end}-prime.xml'
+    params:
+        pretty_sample=lambda wc: wc.sample_name.replace('_', ' '),
+        pretty_bc=lambda wc: wc.barcode_sample_name.replace('_', ' '),
+        pretty_strand=lambda wc: {'fwd': 'forward', 'rev': 'reverse'}[wc.strand],
+        pretty_end=lambda wc: {'three': 'three prime end', 'five': 'five prime end'}[wc.end], 
+    shell:
+        '''
+        python scripts/quickload/quickload.py write \
+          -x {output} \
+          -m overwrite \
+          --name {input} \
+          --title "Illumina data/miCLIP/coverage/{params.pretty_sample}/{params.pretty_bc}/{params.pretty_end}/{params.pretty_strand}" \
+          --description "{params.pretty_strand} strand {params.pretty_end} coverage for {params.pretty_sample} {params.pretty_bc}" \
+          --background="DEE0E0" \
+          --foreground="007c00" \
+          --name-size="14" \
+          --direction-type="none" \
+          --show2tracks="true"
+        '''
+
+
+rule combine_xmls:
+    input:
+        expand(
+            'xml_files/individual/{expanded_sample_name}_{strand}_{end}-prime.xml',
+            strand=['fwd', 'rev'], end=['five', 'three'],
+            expanded_sample_name=EXPANDED_SAMPLE_BARCODE_NAMES
+        )
+    output:
+        'xml_files/miCLIP.xml'
+    shell:
+        '''
+        python scripts/quickload/quickload.py merge \
+          -o {output} {input}
+        '''

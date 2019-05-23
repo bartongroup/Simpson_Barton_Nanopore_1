@@ -1,0 +1,229 @@
+import os
+import re
+import glob
+import itertools as it
+import random
+
+
+configfile: 'config.yml'
+
+
+ILLUMINA_DATA_GLOBS = [
+    '{basedir}/Sample_{bio_rep}/*_R1.fastq.gz'.format(basedir=config['illumina_basedir'], bio_rep=bio_rep)
+    for bio_rep in config['illumina_sample_names']
+]
+ILLUMINA_DATA = list(it.chain(*[glob.glob(fp) for fp in ILLUMINA_DATA_GLOBS]))
+ILLUMINA_DATA_SUBDIRS = [
+    os.path.split(os.path.split(fp)[0])[1] for fp in ILLUMINA_DATA
+]
+ILLUMINA_PREFIXES = [
+    os.path.split(fp)[1].split('_R1.fastq')[0] for fp in ILLUMINA_DATA
+]
+
+
+NANOPORE_DATA_GLOBS = [
+    '{basedir}/{bio_rep}/raw_data/*.dna.fastq'.format(basedir=config['nanopore_basedir'], bio_rep=bio_rep)
+    for bio_rep in config['nanopore_sample_names']
+]
+NANOPORE_DATA = list(it.chain(*[glob.glob(fp) for fp in NANOPORE_DATA_GLOBS]))
+NANOPORE_FRIENDLY_NAMES = [
+    os.path.split(fp)[1].split('.dna')[0] for fp in NANOPORE_DATA
+]
+
+assert len(NANOPORE_FRIENDLY_NAMES) == len(config['nanopore_sample_names'])
+
+
+rule all:
+    input:            
+        expand('flashed/{dir_name}/{illumina_prefixes}.extendedFrags.fastq',
+               zip,
+               dir_name=ILLUMINA_DATA_SUBDIRS,
+               illumina_prefixes=ILLUMINA_PREFIXES),
+        expand(
+            expand(
+                'nanopore_chunks/{sample_name}/{friendly_name}_chunk{{chunk:03d}}.fastq',
+                zip,
+                sample_name=config['nanopore_sample_names'],
+                friendly_name=NANOPORE_FRIENDLY_NAMES),
+            chunk=range(1, config['nchunks'] + 1)
+        ),
+        expand(
+            expand(
+                'nanopore_error_corrected/{sample_name}/{friendly_name}_chunk{{chunk:03d}}/{friendly_name}_chunk{{chunk:03d}}.untrimmed.fq',
+                zip,
+                sample_name=config['nanopore_sample_names'],
+                friendly_name=NANOPORE_FRIENDLY_NAMES),
+            chunk=range(1, config['nchunks'] + 1)
+        ),
+        expand(
+            ['alignments/{sample_name}/{friendly_name}.error_corrected.bam',
+             'alignments/{sample_name}/{friendly_name}.error_corrected.bam.bai',
+             'ref_guided_transcript_assembly/{sample_name}/{friendly_name}.error_corrected.collapsed.gff',
+             "splicing/{sample_name}/{friendly_name}_error_corrected_read_stats.json",
+             "splicing/{sample_name}/{friendly_name}_error_corrected_splice_stats.json"],
+            zip,
+            sample_name=config['nanopore_sample_names'],
+            friendly_name=NANOPORE_FRIENDLY_NAMES,
+        )
+
+
+rule flash_read:
+    input:
+        read='{basedir}/{{dir_name}}/{{prefix}}_R1.fastq.gz'.format(basedir=config['illumina_basedir']),
+        mate='{basedir}/{{dir_name}}/{{prefix}}_R2.fastq.gz'.format(basedir=config['illumina_basedir']),
+    output:
+        'flashed/{dir_name}/{prefix}.extendedFrags.fastq'
+    threads: 8
+    params:
+        prefix=lambda wc, output: output[0].split('.extendedFrags')[0]
+    shell:
+        '''
+        flash --read-len=150 --fragment-len=170 --fragment-len-stddev=50 \
+          -o {params.prefix} -t {threads} {input.read} {input.mate}
+        '''
+
+
+rule chunk_nanopore:
+    input:
+        '{basedir}/{{sample_name}}/raw_data/{{friendly_name}}.dna.fastq'.format(basedir=config['nanopore_basedir'])
+    output:
+        expand(
+            'nanopore_chunks/{{sample_name}}/{{friendly_name}}_chunk{chunk:03d}.fastq',
+            chunk=range(1, config['nchunks'] + 1)
+        )
+    params:
+        output_with_wc=lambda wc, output: re.sub('chunk001', 'chunk%03d', output[0]),
+        nchunks=config['nchunks']
+    shell:
+        '''
+        cd proovread/bin
+        ./SeqChunker --chunk-number {params.nchunks} -o ../../{params.output_with_wc} {input}
+        '''
+
+
+def random_illumina_files(chunk, n_files=2):
+    random.seed(int(chunk))
+    idx = random.sample(range(len(ILLUMINA_PREFIXES)), n_files)
+    random_sample = [
+        'flashed/{dir_name}/{illumina_prefixes}.extendedFrags.fastq'.format(
+            dir_name=ILLUMINA_DATA_SUBDIRS[i],
+            illumina_prefixes=ILLUMINA_PREFIXES[i]
+        ) for i in idx
+    ]
+    return random_sample
+        
+
+rule error_correction:
+    input:
+        nanopore='nanopore_chunks/{sample_name}/{friendly_name}_chunk{chunk}.fastq',
+        illumina=expand(
+            'flashed/{dir_name}/{illumina_prefixes}.extendedFrags.fastq',
+            zip,
+            dir_name=ILLUMINA_DATA_SUBDIRS,
+            illumina_prefixes=ILLUMINA_PREFIXES
+        )
+    output:
+        'nanopore_error_corrected/{sample_name}/{friendly_name}_chunk{chunk}/{friendly_name}_chunk{chunk}.untrimmed.fq'
+    threads: 4
+    params:
+        prefix=lambda wc: f'{wc.friendly_name}_chunk{wc.chunk}',
+        outdir=lambda wc, output: os.path.split(output[0])[0],
+        illumina=lambda wc, output: random_illumina_files(wc['chunk'], config['n_illumina_files_per_chunk'])
+    shell:
+        '''
+        cat {input.nanopore} > $TMPDIR/nanopore_reads.fastq
+        cat {params.illumina} > $TMPDIR/illumina_reads.fastq
+        proovread/bin/proovread -t {threads} -c $(pwd)/proovread.cfg \
+          -l $TMPDIR/nanopore_reads.fastq \
+          -s $TMPDIR/illumina_reads.fastq \
+          --pre $TMPDIR/{params.prefix} \
+          --overwrite --no-sampling
+        mv $TMPDIR/{params.prefix}/* {params.outdir}
+        '''
+
+rule cat_error_corrected:
+    input:
+        expand(
+            'nanopore_error_corrected/{{sample_name}}/{{friendly_name}}_chunk{chunk:03d}/{{friendly_name}}_chunk{chunk:03d}.untrimmed.fq',
+            chunk=range(1, config['nchunks'] + 1)
+        )
+    output:
+        'nanopore_error_corrected/{sample_name}/{friendly_name}.error_corrected.untrimmed.fq'
+    threads: 1
+    shell:
+        '''
+        cat {input} > {output}
+        '''
+
+rule map_data:
+    input:
+        'nanopore_error_corrected/{sample_name}/{friendly_name}.error_corrected.untrimmed.fq'
+    output:
+        bam='alignments/{sample_name}/{friendly_name}.error_corrected.bam',
+        bai='alignments/{sample_name}/{friendly_name}.error_corrected.bam.bai',
+    threads: 8
+    params:
+        reference=config['genome']
+    shell:
+        '''
+        scripts/minimap2-2.8_x64-linux/minimap2 -t {threads} -ax splice -k14 -G 10000 -L --cs {params.reference} {input} |
+        samtools view -bS - |
+        samtools sort -@ {threads} -m 1G -o - - > {output.bam}
+        samtools index {output.bam}
+        '''
+
+
+rule DRS_splicing_details:
+    input:
+        'alignments/{sample_name}/{friendly_name}.error_corrected.bam'
+    params:
+        gtf = config['annotation'],
+        reference = config['genome'],
+        prefix = "splicing/{sample_name}/{friendly_name}_error_corrected_"
+    output:
+        ["splicing/{sample_name}/{friendly_name}_error_corrected_read_stats.json",
+         "splicing/{sample_name}/{friendly_name}_error_corrected_splice_stats.json"]
+    log:
+        "logs/{sample_name}_{friendly_name}_splicingDetails.log"
+    threads: 1
+    shell:
+        "python scripts/DRS_details/DRS_splitCanonicalSpliceReads.py -b {input} -g {params.reference} -l {log} -a {params.gtf} --stripchr --chr_synonyms C:Pt,M:Mt --input_format gtf -p {params.prefix} --pwm --splitreads --spliton annotated,U2"
+
+
+rule pinfish_togff:
+    input:
+        'alignments/{sample_name}/{friendly_name}.error_corrected.bam'
+    output:
+        'ref_guided_transcript_assembly/{sample_name}/{friendly_name}.error_corrected.gff'
+    threads: 8
+    shell:
+        '''
+        scripts/pinfish/spliced_bam2gff/spliced_bam2gff -s -t {threads} -M {input} > {output}
+        '''
+
+
+rule pinfish_cluster:
+    input:
+        'ref_guided_transcript_assembly/{sample_name}/{friendly_name}.error_corrected.gff'
+    output:
+        cls_tab='ref_guided_transcript_assembly/{sample_name}/{friendly_name}.error_corrected.clusters.tsv',
+        cls_gff='ref_guided_transcript_assembly/{sample_name}/{friendly_name}.error_corrected.clusters.gff',
+    threads: 8
+    shell:
+        '''
+        scripts/pinfish/cluster_gff/cluster_gff \
+          -p 1 -t {threads} -c 1 -d 5 -e 20 -a {output.cls_tab} {input} > {output.cls_gff}
+        '''
+
+
+rule pinfish_collapse_partials:
+    input:
+        'ref_guided_transcript_assembly/{sample_name}/{friendly_name}.error_corrected.clusters.gff',
+    output:
+        'ref_guided_transcript_assembly/{sample_name}/{friendly_name}.error_corrected.collapsed.gff'
+    threads: 8
+    shell:
+        '''
+        scripts/pinfish/collapse_partials/collapse_partials \
+          -d 5 -e 100 -f 5000 -t {threads} {input} > {output}
+        '''

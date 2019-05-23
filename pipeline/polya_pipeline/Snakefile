@@ -1,0 +1,80 @@
+import os, glob
+
+configfile: 'config.yaml'
+
+
+rule all:
+    input:
+        expand(
+            ["raw_data/{fn}.dna.fastq.index",
+             "raw_data/{fn}.dna.fastq.index.readdb",
+             "polya_tails/{fn}_polya_lengths.tsv.gz",
+             "aligned_data/{fn}.with_pA_tag.bam.bai"],
+            fn=config['friendly_name']
+        )
+            
+
+
+rule nanopolish_index:
+    input:
+        fastq="raw_data/{fn}.dna.fastq"
+    output:
+        "raw_data/{fn}.dna.fastq.index",
+        "raw_data/{fn}.dna.fastq.index.fai",
+        "raw_data/{fn}.dna.fastq.index.gzi",
+        "raw_data/{fn}.dna.fastq.index.readdb"
+    params:
+        fast5="-d " + " -d ".join(
+            ['{root}/{iind}'.format(root=config['data_root'], iind=d)
+             for d in config['data_dirs']]
+        )
+    shell:
+        '''
+        scripts/nanopolish/nanopolish index \
+        {params.fast5} \
+        {input.fastq}
+        '''
+
+
+rule nanopolish_polya:
+    input:
+        fastq="raw_data/{fn}.dna.fastq",
+        index="raw_data/{fn}.dna.fastq.index",
+        bam="aligned_data/{fn}.bam",
+    output:
+        tsv="polya_tails/{fn}_polya_lengths.tsv.gz"
+    params:
+        reference=config['genome']
+    threads: 28
+    shell:
+        '''
+        scripts/nanopolish/nanopolish polya --threads={threads} \
+        --reads={input.fastq} \
+        --bam={input.bam} \
+        --genome={params.reference} |
+        gzip > {output.tsv}
+        '''
+
+
+rule label_bam:
+    input:
+        tsv='polya_tails/{fn}_polya_lengths.tsv.gz',
+        bam="aligned_data/{fn}.bam"
+    output:
+        bam='aligned_data/{fn}.with_pA_tag.bam'
+    threads: 1
+    shell:
+        '''
+        pAlabel -b {input.bam} -o {output.bam} -p {input.tsv}
+        '''
+
+
+rule sam_index:
+    input:
+        'aligned_data/{fn}.with_pA_tag.bam'
+    output:
+        'aligned_data/{fn}.with_pA_tag.bam.bai'
+    shell:
+        '''
+        samtools index {input}
+        '''

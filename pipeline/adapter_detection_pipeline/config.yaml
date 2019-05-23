@@ -1,0 +1,14 @@
+#---------------#
+# DATA SETTINGS #
+#---------------#
+friendly_name: 201901_col0_adapter_2916
+
+#---------------------------#
+# REFERENCE SETTINGS #
+#---------------------------#
+genome: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa
+  
+#---------------------------#
+# CLUSTER SETTINGS #
+#---------------------------#
+max_threads: 28

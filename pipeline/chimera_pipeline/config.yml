@@ -1,0 +1,26 @@
+#---------------#
+# DATA SETTINGS #
+#---------------#
+comparison: vir1_vs_VIRc
+cond_a: vir1
+cond_b: VIRc
+
+cond_a_sample_names:
+  - 20190317_vir1_2922
+  - 201902_vir1_2923 
+  - 201902_vir1_2924 
+  - 201902_vir1_2925
+
+cond_b_sample_names:
+  - 201812_VIRc_2930
+  - 201812_VIRc_2931
+  - 201902_VIRc_2929
+  - 20190317_VIRc_2928
+
+#---------------------------#
+# REFERENCE SETTINGS #
+#---------------------------#
+
+fasta: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa
+gtf: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_GFF3_genes_transposons.201606.no_chr.gtf
+blacklist_genes: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/plant_tandem_duplicated_genes_db/Arabidopsis_thaliana_gene.tandem_gene_loci.txt

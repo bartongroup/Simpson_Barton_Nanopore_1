@@ -1,0 +1,544 @@
+configfile: 'config.yml'
+
+import os
+import glob
+import re
+import itertools as it
+
+
+INPUT_FASTQ = glob.glob('{basedir}/*/*.fastq.gz'.format(basedir=config['basedir']))
+SAMPLE_IDS = [
+    os.path.split(fn)[1].split('_L00')[0] for fn in INPUT_FASTQ
+]
+SAMPLE_NAMES = [
+    os.path.split(os.path.split(fn)[0])[1] for fn in INPUT_FASTQ
+]
+CONDS = [sn.rsplit('_', 1)[0] for sn in SAMPLE_NAMES]
+
+rule all:
+    input:
+        'qc/multiqc_report.html',
+        'aligned_data/multiqc_report.html',
+        'quantification/multiqc_report.html',
+        expand(
+            'raw_data/{sample_name}.{sample_id}.1.fastq.gz',
+            zip,  sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS
+        ),
+        expand(
+            'aligned_data/{sample_name}.{sample_id}/Aligned.sorted.bam.bai',
+            zip, sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS
+        ),
+        expand(
+            'quantification/{sample_name}.{sample_id}_salmon_output/quant.sf',
+            zip, sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS
+        ),
+        expand(
+            'differential_expression/edgeR/{comp}.tsv',
+            comp=config['comparisons'],
+        ),
+        expand(
+            expand(
+                'coverage_tracks/{sample_name}.{sample_id}.{{strand}}.bw',
+                zip, sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS
+            ),
+            strand=['fwd', 'rev']
+        ),
+        expand(
+            'coverage_tracks/pooled/{sample_name}.{strand}.bw',
+            sample_name=list(set(CONDS)), strand=['fwd', 'rev'], 
+        ),
+        expand(
+            'derfinder_results/{comp}.{strand}.{ft}',
+            comp=config['comparisons'],
+            strand=['fwd', 'rev'],
+            ft=['tsv', 'bed']
+        ),
+        expand(
+            ['derfinder_results/{comp}.bed'],
+            comp=config['comparisons']
+        ),
+        'xml_files/{exp_name}.xml'.format(exp_name=config['experiment_name'])
+
+
+rule fastqc:
+    input:
+        '{basedir}/{{sample_name}}/{{sample_id}}_L00{{lane_number}}_R{{read_number}}.fastq.gz'.format(
+            basedir=config['basedir'])
+    output:
+        'qc/{sample_name}/{sample_id}_L00{lane_number}_R{read_number}_fastqc.html',
+        'qc/{sample_name}/{sample_id}_L00{lane_number}_R{read_number}_fastqc.zip'
+    log:
+        'logs/{sample_name}/{sample_id}_L00{lane_number}_R{read_number}.fastqc.log'
+    shell:
+        '''
+        fastqc -o qc/{wildcards.sample_name} {input}
+        '''
+
+
+rule fastqc_multiqc:
+    input:
+        expand(
+            'qc/{{sample_name}}/{{sample_id}}_L00{lane}_R{read}_fastqc.html',
+            lane=[1, 2, 3, 4, 5], read=[1, 2]
+        )
+    output:
+        'qc/{sample_name}/{sample_id}_multiqc_report.html'
+    log:
+        'logs/{sample_name}/{sample_id}_multiqc.log'
+    params:
+        prefix=lambda wc, output: os.path.split(output[0])[0]
+    shell:
+        '''
+        multiqc -f -o {params.prefix} -i {wildcards.sample_id} {params.prefix}
+        '''
+
+
+rule super_multiqc:
+    input:
+        expand(
+            expand(
+                'qc/{sample_name}/{sample_id}_L00{{lane}}_R{{read}}_fastqc.html',
+                zip, sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS,
+            ),
+            lane=[1, 2, 3, 4, 5], read=[1, 2]
+        )
+    output:
+        'qc/multiqc_report.html'
+    shell:
+        '''
+        multiqc -f -dd 2 -o qc qc
+        '''
+
+
+rule pool_lanes:
+    input:
+        mqc='qc/{sample_name}/{sample_id}_multiqc_report.html',
+        fastq=expand(
+            '{basedir}/{{sample_name}}/{{sample_id}}_L00{lane_number}_R1.fastq.gz',
+            basedir=config['basedir'],
+            lane_number=[1, 2, 3, 4],
+        )
+    output:
+        read='raw_data/{sample_name}.{sample_id}.1.fastq.gz',
+        mate='raw_data/{sample_name}.{sample_id}.2.fastq.gz',
+    log:
+        'logs/{sample_name}_{sample_id}.pool_lanes.log'
+    shell:
+        '''
+        for READ in {input.fastq};
+        do
+          MATE="${{READ%%_R1.fastq.gz}}_R2.fastq.gz"
+          cat $READ >> {output.read}
+          cat $MATE >> {output.mate}
+        done
+        '''
+        
+
+rule build_STAR_index:
+    '''Create the index required for alignment with STAR'''
+    output:
+        directory('STAR_index')
+    log:
+        'logs/STAR_idx.log'
+    threads: 24
+    params:
+        fasta_fn = config['genome'],
+        gtf_fn = config['gtf'],
+        overhang = 149
+    shell:
+        '''
+        mkdir {output};
+        STAR \
+          --runThreadN {threads} \
+          --runMode genomeGenerate \
+          --genomeDir {output} \
+          --genomeFastaFiles {params.fasta_fn} \
+          --sjdbGTFfile {params.gtf_fn} \
+          --sjdbOverhang {params.overhang}
+        '''
+
+
+rule map_with_STAR:
+    '''map reads with STAR spliced aligner'''
+    input:
+        read='raw_data/{sample_name}.1.fastq.gz',
+        mate='raw_data/{sample_name}.2.fastq.gz',
+        index='STAR_index'
+    output:
+        'aligned_data/{sample_name}/Aligned.out.bam'
+    log:
+        'logs/{sample_name}.star_alignment.log'
+    threads: 24
+    params:
+    shell:
+        '''
+        TOPDIR=$(pwd)
+        cd aligned_data/{wildcards.sample_name} ;
+        STAR \
+          --runThreadN {threads} \
+          --genomeDir $TOPDIR/{input.index} \
+          --readFilesIn $TOPDIR/{input.read} $TOPDIR/{input.mate} \
+          --readFilesCommand "zcat" \
+          --outFilterMultimapNmax 5 \
+          --alignSJoverhangMin 8 \
+          --alignSJDBoverhangMin 3 \
+          --outFilterMismatchNmax 5 \
+          --alignIntronMin 60 \
+          --alignIntronMax 10000 \
+          --outSAMtype BAM Unsorted
+        '''
+
+rule sort_with_samtools:
+    input:
+        'aligned_data/{sample_name}/Aligned.out.bam'
+    output:
+        'aligned_data/{sample_name}/Aligned.sorted.bam'
+    log:
+        'logs/{sample_name}.sortbam.log'
+    threads: 8
+    shell:
+        "samtools sort -m 2G -@ {threads} -o {output} {input}"
+        
+
+rule index_with_samtools:
+    input:
+        'aligned_data/{sample_name}/Aligned.sorted.bam'
+    output:
+        'aligned_data/{sample_name}/Aligned.sorted.bam.bai'
+    log:
+        'logs/{sample_name}.indexbam.log'
+    threads: 1
+    shell:
+        "samtools index {input}"
+
+
+rule stats_with_samtools:
+    input:
+        'aligned_data/{sample_name}/Aligned.sorted.bam'
+    output:
+        'aligned_data/{sample_name}/Aligned.sorted.bamstats'
+    log:
+        'logs/{sample_name}.bamstats.log'
+    threads: 1
+    shell:
+        "samtools flagstat {input} > {output}"
+
+
+rule mapping_multiqc:
+    input:
+        expand(
+            'aligned_data/{sample_name}.{sample_id}/Aligned.sorted.bamstats',
+            zip, sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS
+        )
+    output:
+        'aligned_data/multiqc_report.html'
+    shell:
+        '''
+        multiqc -f -dd 2 -o aligned_data aligned_data
+        '''
+
+
+rule build_salmon_index:
+    output:
+        directory('salmon_index')
+    log:
+        'logs/salmon_idx.log'
+    threads:
+        8
+    params:
+        fasta_fn = config['transcriptome']
+    shell:
+        '''
+        cat {params.fasta_fn} > tmp.fa
+        salmon index -p {threads} -i {output} -t tmp.fa
+        rm tmp.fa
+        '''
+
+
+rule pseudoalign_with_salmon:
+    input:
+        read='raw_data/{sample_name}.1.fastq.gz',
+        mate='raw_data/{sample_name}.2.fastq.gz',
+        index='salmon_index'
+    output:
+        'quantification/{sample_name}_salmon_output/quant.sf'
+    log:
+        'logs/{sample_name}.salmon_quant.log'
+    params:
+        prefix=lambda wc, output: os.path.split(output[0])[0]
+    threads:
+        8
+    shell:
+        '''
+        salmon quant -l A -p {threads} \
+          -i {input.index} \
+          -1 {input.read} -2 {input.mate} \
+          -o {params.prefix}
+        '''
+
+
+rule salmon_multiqc:
+    input:
+        expand(
+            'quantification/{sample_name}.{sample_id}_salmon_output/quant.sf',
+            zip, sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS
+        )
+    output:
+        'quantification/multiqc_report.html'
+    shell:
+        '''
+        multiqc -f -dd 2 -o quantification quantification
+        '''
+
+
+def edgeR_input(sample_name):
+    samples = set([
+        (s_name, s_id) for s_name, s_id in zip(SAMPLE_NAMES, SAMPLE_IDS)
+        if re.match(sample_name, s_name)
+    ])
+    sample_fns = [
+        'quantification/{}.{}_salmon_output/quant.sf'.format(s_name, s_id)
+        for s_name, s_id in samples
+    ]
+    return sample_fns
+
+
+rule run_edgeR:
+    input:
+        cntrl=lambda wc: edgeR_input(wc.cntrl_sample),
+        treat=lambda wc: edgeR_input(wc.treat_sample),
+    output:
+        tsv='differential_expression/edgeR/{treat_sample}_vs_{cntrl_sample}.tsv',
+    params:
+        cntrl_with_flags=lambda wc, input: ' '.join(['-cf {}'.format(i) for i in input.cntrl]),
+        treat_with_flags=lambda wc, input: ' '.join(['-tf {}'.format(i) for i in input.treat])
+    shell:
+        '''
+        python scripts/run_edgeR.py \
+          {params.cntrl_with_flags} \
+          {params.treat_with_flags} \
+          -cn {wildcards.cntrl_sample} \
+          -tn {wildcards.treat_sample} \
+          -o {output.tsv}
+        '''
+
+
+rule split_strand:
+    input:
+        bam='aligned_data/{sample_name}/Aligned.sorted.bam',
+        bai='aligned_data/{sample_name}/Aligned.sorted.bam.bai'
+    output:
+        bam='aligned_data/{sample_name}/Aligned.sorted.{strand}.bam',
+        bai='aligned_data/{sample_name}/Aligned.sorted.{strand}.bam.bai'
+    params:
+        samflags_1=lambda wc: '-f 128 -F 16' if wc.strand == 'fwd' else '-f 144',
+        samflags_2=lambda wc: '-f 80' if wc.strand == 'fwd' else '-f 64 -F 16'
+    threads: 4
+    shell:
+        '''
+        samtools view -@ {threads} -b {params.samflags_1} {input.bam} > {output.bam}.1.bam
+        samtools index -@ {threads} {output.bam}.1.bam
+        samtools view -@ {threads} -b {params.samflags_2} {input.bam} > {output.bam}.2.bam
+        samtools index -@ {threads} {output.bam}.2.bam
+        samtools merge -@ {threads} {output.bam} {output.bam}.1.bam {output.bam}.2.bam
+        samtools index -@ {threads} {output.bam}
+        rm {output.bam}.[12].bam
+        rm {output.bam}.[12].bam.bai
+        '''
+
+
+rule genome_coverage:
+    input:
+        bam='aligned_data/{sample_name}/Aligned.sorted.{strand}.bam',
+        bai='aligned_data/{sample_name}/Aligned.sorted.{strand}.bam.bai'
+    output:
+        'coverage_tracks/{sample_name}.{strand}.bw',
+    params:
+        chrom_sizes=config['chrom_sizes'],
+    shell:
+        '''
+        samtools depth -d0 {input.bam} | awk -v OFS='\t' '{{print $1, $2-1, $2, $3}}' > {output}.tmp.bdg
+        bedGraphToBigWig {output}.tmp.bdg {params.chrom_sizes} {output}
+        rm {output}.tmp.bdg
+        '''
+
+
+rule pool_bigwigs:
+    input:
+        lambda wc: list(set(expand(
+            'coverage_tracks/{sn}.{si}.{{strand}}.bw',
+            zip,
+            sn=[sn for sn in SAMPLE_NAMES if sn.startswith(wc.cond)],
+            si=[si for i, si in enumerate(SAMPLE_IDS) if SAMPLE_NAMES[i].startswith(wc.cond)]
+        )))
+    output:
+        'coverage_tracks/pooled/{cond}.{strand}.bw'
+    params:
+        chrom_sizes=config['chrom_sizes']
+    shell:
+        '''
+        bigWigMerge {input} {output}.tmp.bdg
+        LC_COLLATE=C sort -k1,1 -k2,2n {output}.tmp.bdg > {output}.sorted.tmp.bdg
+        bedGraphToBigWig {output}.sorted.tmp.bdg {params.chrom_sizes} {output}
+        rm {output}.tmp.bdg {output}.sorted.tmp.bdg
+        '''
+
+
+def derfinder_input(sample_name, strand):
+    samples = set([
+        (s_name, s_id) for s_name, s_id in zip(SAMPLE_NAMES, SAMPLE_IDS)
+        if re.match(sample_name, s_name)
+    ])
+    sample_fns = [
+        'coverage_tracks/{}.{}.{}.bw'.format(s_name, s_id, strand) for s_name, s_id in samples
+    ]
+    return sample_fns
+
+
+rule run_derfinder:
+    input:
+        cntrl=lambda wc: derfinder_input(wc.cntrl_sample, wc.strand),
+        treat=lambda wc: derfinder_input(wc.treat_sample, wc.strand),
+    output:
+        tsv='derfinder_results/{treat_sample}_vs_{cntrl_sample}.{strand}.tsv',
+        bed='derfinder_results/{treat_sample}_vs_{cntrl_sample}.{strand}.bed',
+    params:
+        strand_sc=lambda wc: {'fwd': '+', 'rev': '-'}[wc.strand],
+        cntrl_with_flags=lambda wc, input: ' '.join(['-cb {}'.format(i) for i in input.cntrl]),
+        treat_with_flags=lambda wc, input: ' '.join(['-tb {}'.format(i) for i in input.treat])
+    shell:
+        '''
+        python scripts/run_derfinder.py \
+          {params.cntrl_with_flags} \
+          {params.treat_with_flags} \
+          -cn {wildcards.cntrl_sample} \
+          -tn {wildcards.treat_sample} \
+          -o {output.tsv} \
+          -b {output.bed} \
+          -s {params.strand_sc}
+        '''
+
+
+rule merge_derfinder_strand:
+    input:
+        expand('derfinder_results/{{comp}}.{strand}.bed', strand=['fwd', 'rev'])
+    output:
+        'derfinder_results/{comp,\w+}.bed'
+    shell:
+        '''
+        cat {input} | sort -k1,1 -k2,2n > {output}
+        '''
+
+
+rule derfinder_to_igb_gtf:
+    input:
+        'derfinder_results/{treat_sample}_vs_{cntrl_sample}.bed'
+    output:
+        'derfinder_results/{treat_sample}_vs_{cntrl_sample,[^.]+}.gtf'
+    shell:
+        '''
+        awk -v OFS='\t' '{{
+            print $1, "derfinder", "differentially_expressed_region", \
+            $2, $3, $5, $6, ".", "mean_coverage=" $7 "; logFC=" $5 "; log10_p_value=" $10 "; log10_fdr=" $11 ";"
+        }}' {input} > {output}
+        '''   
+
+
+rule coverage_xml:
+    input:
+        'coverage_tracks/{sample_name}.{sample_id}.{strand}.bw'
+    output:
+        'xml_files/individual/{sample_name}.{sample_id}.{strand}.xml'
+    params:
+        sample=lambda wc: wc.sample_name,
+        condition=lambda wc: wc.sample_name.split('_')[0],
+        pretty_strand=lambda wc: {'fwd': 'forward', 'rev': 'reverse'}[wc.strand],
+        exp_name=config['experiment_name']
+    shell:
+        '''
+        python scripts/quickload/quickload.py write \
+          -x {output} \
+          -m overwrite \
+          --name {input} \
+          --title "Illumina data/{params.exp_name}/coverage/{params.condition}/{params.sample}/{params.pretty_strand}" \
+          --description "{params.pretty_strand} strand coverage of {params.sample}" \
+          --background="DEE0E0" \
+          --foreground="007c00" \
+          --name-size="14" \
+          --direction-type="none" \
+          --show2tracks="true"
+        '''
+
+
+rule pooled_coverage_xml:
+    input:
+        'coverage_tracks/pooled/{sample_name}.{strand}.bw'
+    output:
+        'xml_files/individual/{sample_name}_pooled.{strand}.xml'
+    params:
+        sample=lambda wc: wc.sample_name,
+        pretty_strand=lambda wc: {'fwd': 'forward', 'rev': 'reverse'}[wc.strand],
+        exp_name=config['experiment_name']
+    shell:
+        '''
+        python scripts/quickload/quickload.py write \
+          -x {output} \
+          -m overwrite \
+          --name {input} \
+          --title "Illumina data/{params.exp_name}/coverage/pooled/{params.sample}/{params.pretty_strand}" \
+          --description "{params.pretty_strand} strand coverage of {params.sample} (pooled)" \
+          --background="DEE0E0" \
+          --foreground="007c00" \
+          --name-size="14" \
+          --direction-type="none" \
+          --show2tracks="true"
+        '''
+
+
+rule derfinder_xml:
+    input:
+        'derfinder_results/{comparison}.gtf'
+    output:
+        'xml_files/individual/{comparison}.gtf'
+    params:
+        exp_name=config['experiment_name']
+    shell:
+        '''
+        python scripts/quickload/quickload.py write \
+          -x {output} \
+          -m overwrite \
+          --name {input} \
+          --title "Illumina data/{params.exp_name}/derfinder/{wildcards.comparison}" \
+          --description "Differentially expressed regions of {wildcards.comparison}" \
+          --background="DEE0E0" \
+          --foreground="007c00" \
+          --name-size="14" \
+          --direction-type="none" \
+          --show2tracks="true"
+        '''
+
+
+rule combine_xml:
+    input:
+        expand(
+            'xml_files/individual/{comparison}.gtf',
+            comparison=config['comparisons'],
+        ),
+        expand(
+            'xml_files/individual/{sample_name}_pooled.{strand}.xml',
+            sample_name=CONDS, strand=['fwd', 'rev']
+        ),
+        expand(
+            expand(
+                'xml_files/individual/{sample_name}.{sample_id}.{{strand}}.xml',
+                zip, sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS
+            ),
+            strand=['fwd', 'rev']
+        ),
+    output:
+        'xml_files/{exp_name}.xml'.format(exp_name=config['experiment_name'])
+    shell:
+        '''
+        python scripts/quickload/quickload.py merge \
+          -o {output} {input}
+        '''

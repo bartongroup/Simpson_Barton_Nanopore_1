@@ -1,0 +1,162 @@
+import os
+import re
+import glob
+import itertools as it
+import random
+
+import pandas as pd
+from rpy2 import robjects as robj
+from rpy2.robjects.packages import importr
+from rpy2.robjects import pandas2ri
+pandas2ri.activate()
+
+
+configfile: 'config.yml'
+
+BAM_FNS = glob.glob('aligned_data/*.bam')
+SAMPLE_NAMES = [os.path.split(fn)[1].split('.')[0]
+                for fn in BAM_FNS]
+
+rule all:
+    input:
+        'exon_expression/chunk_counts.tsv',
+        'differential_expression/dexseq_output.tsv',
+        'differential_expression/dexseq_sig_exons.bed',
+
+
+rule make_chunks:
+    output:
+        'annot/chunks.bed',
+    params:
+        gtf=config['gtf']
+    shell:
+        '''
+        python scripts/exon_chunks.py -g {params.gtf} |
+        sort -k1,1 -k2,2n > {output}
+        '''
+
+
+rule count_chunks:
+    input:
+        reads='aligned_data/{friendly_name}.{strand}.bam',
+        chunks_bed='annot/chunks.bed'
+    output:
+        'exon_expression/{friendly_name}.{strand}.exon_counts.bed'
+    params:
+        strand=lambda wc: {'fwd': '+', 'rev': '-'}[wc.strand]
+    shell:
+        '''
+        awk '$6 == "{params.strand}"' {input.chunks_bed} | 
+        bedtools intersect -split -sorted -c \
+            -a stdin -b {input.reads} > {output}
+        '''
+
+
+rule cat_fwd_rev:
+    input:
+        fwd='exon_expression/{friendly_name}.fwd.exon_counts.bed',
+        rev='exon_expression/{friendly_name}.rev.exon_counts.bed',
+    output:
+        'exon_expression/{friendly_name}.exon_counts.bed'
+    shell:
+        '''
+        cat {input} | sort -k1,1 -k2,2n > {output}
+        '''
+
+
+rule concat_chunks:
+    input:
+        expand('exon_expression/{friendly_name}.exon_counts.bed',
+               friendly_name=SAMPLE_NAMES)
+    output:
+        'exon_expression/chunk_counts.tsv'
+    run:
+        chunk_counts = []
+        for fn in input:
+            friendly_name = re.search('exon_expression/(.+?).exon_counts.bed$', fn).group(1)
+            c = pd.read_csv(
+                fn,
+                sep='\t',
+                names=['chrom', 'start', 'end', 'gene_id', 'score', 'strand', friendly_name],
+                usecols=['chrom', 'start', 'end', 'gene_id', 'strand', friendly_name],
+            )
+            gene_id_ctype = c.gene_id.str.split('_', n=1, expand=True)
+            c['gene_id'] = gene_id_ctype[0]
+            c['chunk_type'] = gene_id_ctype[1]
+            c['inv'] = (c.chrom.astype(str) + '-' +
+                        c.start.astype(str) + '-' +
+                        c.end.astype(str) + '(' +
+                        c.strand + ')')
+            c = c[['gene_id', 'inv', 'chunk_type', friendly_name]].set_index(['gene_id', 'inv', 'chunk_type'])
+            chunk_counts.append(c)
+        chunk_counts = pd.concat(chunk_counts, axis=1).reset_index()
+        chunk_counts.to_csv(output[0], sep='\t', index=False)
+
+
+rule run_dexseq:
+    input:
+        'exon_expression/chunk_counts.tsv'
+    output:
+        'differential_expression/dexseq_output.tsv'
+    run:
+        dexseq = importr('DEXSeq')
+        counts = pd.read_csv(
+            input[0],
+            sep='\t',
+            header=0,
+            index_col=['gene_id', 'inv', 'chunk_type'],
+        )
+        # filter out introns/exons which are not expressed
+        counts = counts[counts.sum(1) > 10]
+        # create coldata
+        conds = counts.columns.str.split('_', n=1, expand=True).get_level_values(0).tolist()
+        col_data = pd.DataFrame(
+            conds, index=counts.columns, columns=['condition'])
+        count_index = counts.index.to_frame(index=False)
+        counts.reset_index(inplace=True, drop=True)
+
+        # run DEXseq
+        dxd = dexseq.DEXSeqDataSet(
+            countData=robj.Matrix(counts.values),
+            sampleData=col_data,
+            design=robj.Formula(' ~ sample + exon + condition:exon'),
+            featureID=robj.StrVector(count_index.inv),
+            groupID=robj.StrVector(count_index.gene_id)
+        )
+        dxd_results = dexseq.DEXSeq(dxd, quiet=False)
+
+        def get_lfc_cols(dxd_results):
+            cols = list(dxd_results.slots['listData'].names)
+            c = [c for c in cols if c.startswith('log2fold')]
+            assert len(c) == 1
+            return c[0]
+
+        # convert to a pandas object and save
+        dxd_res = pd.DataFrame.from_dict({
+            'gene_id': list(dxd_results.slots['listData'].rx2('groupID')),
+            'inv': dxd_results.slots['listData'].rx2('featureID'),
+            'CPM': dxd_results.slots['listData'].rx2('exonBaseMean'),
+            'logFC': dxd_results.slots['listData'].rx2(get_lfc_cols(dxd_results)),
+            'p_val': dxd_results.slots['listData'].rx2('pvalue'),
+            'fdr': dxd_results.slots['listData'].rx2('padj')
+        })
+        dxd_res = dxd_res.merge(count_index,
+                                left_on=['gene_id', 'inv'],
+                                right_on=['gene_id', 'inv'])
+        dxd_res.to_csv(output[0], sep='\t', index=False)
+
+
+rule sig_dex_genes:
+    input:
+        'differential_expression/dexseq_output.tsv'
+    output:
+        'differential_expression/dexseq_sig_exons.bed'
+    run:
+        dxd_res = pd.read_csv(input[0], sep='\t')
+        bed = open(output[0], 'w')
+        for gene_id, inv, cpm, logFC, p_val, fdr, chunk_type in dxd_res[dxd_res.fdr < 0.05].itertuples(index=False):
+            chrom, start, end, strand = re.search('^([\dMP]t?)-(\d+)-(\d+)\(([-+])\)$', inv).groups()
+            bed.write(
+                f'{chrom}\t{start}\t{end}\t{gene_id}_{chunk_type}\t{logFC:.2f}\t{strand}\t{cpm}\t{p_val}\t{fdr}\n'
+            )
+        bed.close()

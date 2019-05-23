@@ -1,0 +1,33 @@
+#---------------#
+# DATA SETTINGS #
+#---------------#
+data_root: fast5_softlinks
+friendly_name: 201901_col0_2916
+flowcell: FLO-MIN106
+kit: SQK-RNA001
+rebasecall: True
+detect_adapter: True
+run_tombo: True
+make_quickload: True
+
+#---------------------------#
+# REFERENCE SETTINGS #
+#---------------------------#
+genomes:
+  TAIR10: /cluster/gjb_lab/nschurch/Projects/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa
+transcriptomes:
+  araport11: /cluster/gjb_lab/nschurch/Projects/Arabidopsis_annotations/Araport/v11/201606/Araport11_genes.201606.cdna.fasta
+spikein_reference:
+  ERCC92: /cluster/gjb_lab/nschurch/Projects/Arabidopsis_annotations/ERCC_spikeins/ERCC92.fa
+
+#---------------------------#
+# ANNOTATION SETTINGS 	    #
+#---------------------------#
+gtfs:
+  TAIR10: /cluster/gjb_lab/nschurch/Projects/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.35.gtf
+  ERCC92: /cluster/gjb_lab/nschurch/Projects/Arabidopsis_annotations/ERCC_spikeins/ERCC92_genes.gtf
+  
+#---------------------------#
+# CLUSTER SETTINGS #
+#---------------------------#
+max_threads: 24
