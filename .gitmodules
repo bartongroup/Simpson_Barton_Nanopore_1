@@ -1,0 +1,3 @@
+[submodule "tools/adapter_detector"]
+	path = tools/adapter_detector
+	url = https://mparker2@github.com/bartongroup/MP_adapter_detector
