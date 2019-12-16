@@ -1,0 +1,153 @@
+import os, glob
+import random
+import itertools as it
+
+import pandas as pd
+
+configfile: 'config.yml'
+
+    
+rule all:
+    input:
+        'endcut/nanopore_endcut_res.bed'
+
+
+rule merge_sRNAs:
+    input:
+        miRNA=config['miRNA_tsv'],
+        tasiRNA=config['tasiRNA_tsv']
+    output:
+        seqs='sequences/sRNAs_all.fa'
+    run:
+        miRNA = pd.read_csv(input.miRNA, sep='\t')
+        tasiRNA = pd.read_csv(input.tasiRNA, sep='\t')
+        with open(output[0], 'w') as fasta:
+            for _, name, seq in it.chain(miRNA.itertuples(), tasiRNA.itertuples()):
+                fasta.write(f'>{name}\n{seq}\n')
+
+
+rule shuffle_sRNAs:
+    input:
+        'sequences/sRNAs_all.fa'
+    output:
+        'sequences/sRNAs_shuffled_{i}.fa'
+    run:
+        with open(input[0]) as inseq, open(output[0], 'w') as outseq:
+            while True:
+                try:
+                    name = next(inseq).strip()[1:]
+                except StopIteration:
+                    break
+                seq = next(inseq).strip()
+                seq_shuf = list(seq)
+                random.shuffle(seq_shuf)
+                seq_shuf = ''.join(seq_shuf)
+                outseq.write(f'>{name}\n{seq_shuf}\n')
+
+
+rule clean_transcriptome_for_GSTAr:
+    input:
+        transcriptome=config['transcriptome']
+    output:
+        'sequences/transcriptome.fa'
+    shell:
+        '''
+        sed -re 's/>(AT[12345MC]G[0-9]{{5}}\.[0-9]+).*$/>\\1/' {input} > {output}
+        '''        
+
+
+rule map_sRNAs_with_GSTAr:
+    input:
+        sRNAs='sequences/sRNAs_{all_or_shuffled}.fa',
+        transcriptome='sequences/transcriptome.fa'
+    output:
+        'aligned_data/{all_or_shuffled}_sRNAs_mapping.tsv'
+    threads: 12
+    shell:
+        '''
+        python scripts/GSTAr_parallel.py \
+          -s {input.sRNAs} \
+          -t {input.transcriptome} \
+          -o {output} \
+          -n {threads}
+        '''
+
+
+rule transcriptomic_to_genomic_mapping:
+    input:
+        srnas='aligned_data/{all_or_shuffled}_sRNAs_mapping.tsv',
+    output:
+        'aligned_data/{all_or_shuffled}_sRNAs_genomic_mapping.bed'
+    params:
+        annot=config['annotation_bed12'],
+    shell:
+        '''
+        python scripts/GSTAr_transcriptomic_to_genomic.py \
+          -a {params.annot} \
+          -s {input.srnas} \
+          -o {output}
+        '''
+
+
+rule filter_spliced_and_5utr:
+    input:
+        'aligned_data/{all_or_shuffled}_sRNAs_genomic_mapping.bed'
+    output:
+        'aligned_data/{all_or_shuffled}_sRNAs_genomic_mapping.filtered.bed'
+    params:
+        annot=config['annotation_gff']
+    shell:
+        '''
+        awk '$10 == 1' {input} |
+        bedtools intersect -v -a stdin \
+          -b <(awk '$3 == "five_prime_UTR"' {params.annot}) |
+        sort -k1,1 -k2,2n | uniq \
+        > {output}
+        '''
+
+
+rule add_cleavage_logratios:
+    input:
+        'aligned_data/{all_or_shuffled}_sRNAs_genomic_mapping.filtered.bed'
+    output:
+        'aligned_data/{all_or_shuffled}_sRNAs_genomic_mapping.scored.bed'
+    params:
+        fwd_bw=config['bigwigs']['fwd'],
+        rev_bw=config['bigwigs']['rev'],
+    shell:
+        '''
+        python scripts/srna_cleavage_logratio.py \
+          -f {params.fwd_bw} \
+          -r {params.rev_bw} \
+          -s {input} \
+          -o {output}
+        '''
+        
+
+rule concat_shuffled_res:
+    input:
+        expand(
+            'aligned_data/shuffled_{i}_sRNAs_genomic_mapping.scored.bed',
+            i=range(config['n_shuffles'])
+        ),
+    output:
+        'aligned_data/all_shuffled_sRNAs_genomic_mapping.scored.bed'
+    shell:
+        '''
+        cat {input} | sort -k1,1 -k2,2n > {output}
+        '''
+
+
+rule nanopore_endcut:
+    input:
+        srnas='aligned_data/all_sRNAs_genomic_mapping.scored.bed',
+        shuffled='aligned_data/all_shuffled_sRNAs_genomic_mapping.scored.bed'
+    output:
+        'endcut/nanopore_endcut_res.bed'
+    shell:
+        '''
+        python scripts/nanopore_endcut.py \
+          -s {input.srnas} \
+          -c {input.shuffled} \
+          -o {output}
+        '''

@@ -2,9 +2,11 @@ basedir: fastq_softlinks
 experiment_name: vir_fpa_RNAseq
 
 genome: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa
+spikeins: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/ERCC_spikeins/ERCC92.fa
 chrom_sizes: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.chrom.sizes
 gtf: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.35.gtf
 gff_tbx: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_GFF3_genes_transposons.201606.no_chr.gff.gz
+flat_gene_bed12: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_GFF3_genes_transposons.flat_genes.bed
 transcriptome: 
   - /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_genes.201606.cdna.fasta
   - /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_non_coding.201606.cdna.fasta

@@ -1,0 +1,134 @@
+import os, glob
+
+configfile: 'config.yml'
+
+if config['make_quickload']:
+    include: 'scripts/quickload/quickload.rules'
+
+rule all:
+    input:
+        'der_analysis/der_sites_with_logodds.bed',
+        'der_analysis/der_sites_thresholded.bed',
+        'der_analysis/der_data.h5',
+        'der_analysis/der_g_stat.bedgraph',
+#        'motif_detection/motifs.meme',
+#        'motif_detection/der_motifs.gtf',
+#        'xml_files/{unique_name}_modifications.xml'.format(
+#            unique_name=config['comparison']) if config['make_quickload'] else []
+
+
+rule der_analysis:
+    input:
+        cond_a = expand(
+            'alignments/{sample_name}.bam',
+            sample_name=config['cond_a_sample_names']
+        ),
+        cond_b = expand(
+            'alignments/{sample_name}.bam',
+            sample_name=config['cond_b_sample_names']
+        )
+    output:
+        bed='der_analysis/der_sites_with_logodds.bed',
+        hdf='der_analysis/der_data.h5'
+    params:
+        cond_a_flag = ' '.join([
+            f'-a {fn}' for fn in
+            expand(
+                'alignments/{sample_name}.bam',
+                sample_name=config['cond_a_sample_names']
+            )
+        ]),
+        cond_b_flag = ' '.join([
+            f'-b {fn}' for fn in
+            expand(
+                'alignments/{sample_name}.bam',
+                sample_name=config['cond_b_sample_names']
+            )
+        ]),
+        fasta = config['fasta']
+    threads: 8
+    shell:
+        '''
+        differr \
+          -r {params.fasta} \
+          {params.cond_a_flag} \
+          {params.cond_b_flag} \
+          -o {output.bed} \
+          -c {output.hdf}
+        '''
+
+rule threshold_der_sites:
+    input:
+        'der_analysis/der_sites_with_logodds.bed'
+    output:
+        bed='der_analysis/der_sites_thresholded.bed',
+        bedgraph='der_analysis/der_g_stat.bedgraph',
+    shell:
+        '''
+        awk '$7 > 1' {input} > {output.bed}
+        cut -f1,2,3,8 {input} > {output.bedgraph}
+        '''
+
+
+rule motif_analysis:
+    input:
+        'der_analysis/der_sites_thresholded.bed'
+    output:
+        meme=directory('motif_detection/motifs.meme'),
+        seqs='motif_detection/der_site_seqs.fa'
+    log:
+        'logs/meme.log'
+    params:
+        fasta=config['fasta'],
+        fai=config['fasta'] + '.fai'
+    shell:
+        '''
+        bedtools merge -s -c 4,5,6 -o distinct,first,distinct \
+          -i {input} |
+        bedtools slop -b 6 \
+          -i stdin \
+          -g <(cut -f-2 {params.fai}) |
+        bedtools getfasta -s \
+          -fi {params.fasta} \
+          -fo {output.seqs} \
+          -bed stdin
+        meme -oc {output.meme} -minsites 100 \
+          -dna -nmotifs 1 \
+          -minw 5 -maxw 7 \
+          -mod zoops \
+          {output.seqs}
+        '''
+
+rule find_motifs:
+    input:
+        seqs='motif_detection/der_site_seqs.fa',
+        meme='motif_detection/motifs.meme'
+    output:
+        fimo=directory('motif_detection/motifs.fimo'),
+        motifs='motif_detection/der_motifs.gtf'
+    log:
+        'logs/fimo.log'
+    shell:
+        '''
+        fimo --norc --thresh 0.1 --qv-thresh \
+            -oc {output.fimo} \
+            {input.meme}/meme.txt \
+            {input.seqs}
+        awk -v OFS='\\t' '
+            $0 !~ "^##" {{
+                split($1,a,":");
+                split(a[2],b,"(");
+                split(b[1],pos,"-");
+                strand=substr(b[2], 1, 1);
+                if (strand == "+") {{
+                    start=$4+pos[1];
+                    end=$5+pos[1];
+                }}
+                else {{
+                    start=pos[2]-($5-1);
+                    end=pos[2]-($4-1);
+                }}
+                print a[1], $2, $3, start, end, $6, strand, $8, $9 $10
+            }}' {output.fimo}/fimo.gff > {output.motifs}
+            
+        '''

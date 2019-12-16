@@ -53,7 +53,7 @@ COMMON_EXPAND_KWARGS = {
 
 rule all:
     input:
-        expand(
+        list(set(expand(
             ['qc/pre/{all_sample_name_including_input}_fastqc.zip',
              'qc/pre/preprocessing_multiqc_report.html',
              'raw_data/umi_extracted/{sample_name}.fastq.gz',
@@ -62,10 +62,10 @@ rule all:
              'aligned_data/{expanded_sample_name}/Aligned.{bam_level}.bam{bam_suffixes}',
              'aligned_data/{pooled_input_sample_name}/Aligned.sorted.bam{bam_suffixes}',
              'post_aligned_data/{expanded_sample_name}_{strand}_{end}-prime.bigwig',
-             'motif_detection/{expanded_sample_name}.meme',
              'post_aligned_data/miCLIP_expt_pooled_{strand}_{end}-prime.bigwig'],
-            **COMMON_EXPAND_KWARGS),
+            **COMMON_EXPAND_KWARGS))),
         'peaks/final/iCLIP_peaks.bed',
+        directory('motif_detection/iclip_motifs.meme'),
         'xml_files/miCLIP.xml',
 
 
@@ -400,7 +400,7 @@ rule iclip_sig_testing_piranha:
     shell:
         '''
         Piranha -s -o {output} -p 0.5 -u 0 -c {input.iclip} {input.cntrl}
-        awk -v OFS='\\t' '{{print $1, $2, $3, "peak", $7, $6, $5, $7, $7, $2, "0", "0"}}' \
+        awk -v OFS='\\t' '{{print $1, $2, $3, "peak", -log($7)/log(10), $6, $5, $7, $7, $2, "0", "0"}}' \
           {output} > {output}.tmp
         mv {output}.tmp {output}
         '''
@@ -415,9 +415,9 @@ rule run_idr:
     threads: 1
     shell:
         '''
-        idr --samples {input.sample_a} {input.sample_b} \
-          --input-file-type bed --rank 5 --peak-merge-method min \
-          -o {output}
+        idr --samples {input.sample_a} {input.sample_b} --plot \
+          --input-file-type bed --rank score --output-file-type bed \
+          -i 0.05 -o {output}
         '''
 
 rule pool_reads:
@@ -468,32 +468,32 @@ rule toppeaks:
         set +o pipefail # not sure what the command causing this requirement is but the output appears corrects
         MINPEAKS=$(wc -l {input.idr} | grep -v total | awk '{{print $1}}' | sort -k1,1n | head -n1)
         echo "using top $MINPEAKS peaks" > {output.count}
-        sort -k5,5g {input.oracle} | head -n $MINPEAKS | sort -k1,1 -k2,2n > {output.peaks}
+        sort -k5,5gr {input.oracle} | head -n $MINPEAKS | sort -k1,1 -k2,2n > {output.peaks}
         '''
 
 
 rule detect_motifs_with_meme:
     '''Find motifs de novo using MEME'''
     input:
-        'peaks/initial/{sample_name}.{barcode_sample_name}.peaks.bed'
+        'peaks/final/iCLIP_peaks.bed'
     output:
-        directory('motif_detection/{sample_name}.{barcode_sample_name}.meme')
-    log:
-        'logs/{sample_name}.{barcode_sample_name}.meme.log'
+        directory('motif_detection/iclip_motifs.meme')
     threads: 1
     params:
+        prot_coding = config['prot_coding'],
         fasta = config['fasta'],
         fai = '{}.fai'.format(config['fasta'])
     shell:
         '''
-        bedtools slop -b 25 -i {input} -g <(cut -f1-2 {params.fai}) \
-        > motif_detection/{wildcards.sample_name}.{wildcards.barcode_sample_name}.slop.bed
+        bedtools intersect -s -u -a {input} -b {params.prot_coding} |
+        bedtools slop -b 25 -i stdin -g <(cut -f1-2 {params.fai}) \
+        > motif_detection/iclip_sites.slop.bed
         bedtools getfasta -s \
           -fi {params.fasta} \
-          -fo motif_detection/{wildcards.sample_name}.{wildcards.barcode_sample_name}.slop.fa \
-          -bed motif_detection/{wildcards.sample_name}.{wildcards.barcode_sample_name}.slop.bed
+          -fo motif_detection/iclip_sites.slop.fa \
+          -bed motif_detection/iclip_sites.slop.bed
         meme -oc {output} -dna -nmotifs 4 -minw 5 -maxw 8 -mod zoops \
-          motif_detection/{wildcards.sample_name}.{wildcards.barcode_sample_name}.slop.fa
+          motif_detection/iclip_sites.slop.fa
         '''
 
 

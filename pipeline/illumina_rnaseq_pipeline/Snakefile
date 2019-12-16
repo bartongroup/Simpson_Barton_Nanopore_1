@@ -29,6 +29,10 @@ rule all:
             zip, sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS
         ),
         expand(
+            'spikein_aligned_data/{sample_name}.{sample_id}/Aligned.sorted.bam.bai',
+            zip, sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS
+        ),
+        expand(
             'quantification/{sample_name}.{sample_id}_salmon_output/quant.sf',
             zip, sample_name=SAMPLE_NAMES, sample_id=SAMPLE_IDS
         ),
@@ -54,7 +58,8 @@ rule all:
             ft=['tsv', 'bed']
         ),
         expand(
-            ['derfinder_results/{comp}.bed'],
+            ['derfinder_results/{comp}.bed',
+             'dapars/{comp}/{comp}_dapars_results.tsv'],
             comp=config['comparisons']
         ),
         'xml_files/{exp_name}.xml'.format(exp_name=config['experiment_name'])
@@ -132,7 +137,28 @@ rule pool_lanes:
           cat $MATE >> {output.mate}
         done
         '''
+
+
+rule build_spikein_STAR_index:
+    '''Create the index required for alignment with STAR'''
+    output:
+        directory('spikein_STAR_index')
+    log:
+        'logs/STAR_idx.log'
+    threads: 24
+    params:
+        fasta_fn = config['spikeins'],
+    shell:
+        '''
+        mkdir {output};
+        STAR \
+          --runThreadN {threads} \
+          --runMode genomeGenerate \
+          --genomeDir {output} \
+          --genomeFastaFiles {params.fasta_fn} \
+        '''
         
+
 
 rule build_STAR_index:
     '''Create the index required for alignment with STAR'''
@@ -188,13 +214,43 @@ rule map_with_STAR:
           --outSAMtype BAM Unsorted
         '''
 
+
+rule map_spikeins_with_STAR:
+    '''map reads with STAR spliced aligner'''
+    input:
+        read='raw_data/{sample_name}.1.fastq.gz',
+        mate='raw_data/{sample_name}.2.fastq.gz',
+        index='spikein_STAR_index'
+    output:
+        'spikein_aligned_data/{sample_name}/Aligned.out.bam'
+    log:
+        'logs/{sample_name}.spikein_star_alignment.log'
+    threads: 24
+    params:
+    shell:
+        '''
+        TOPDIR=$(pwd)
+        cd spikein_aligned_data/{wildcards.sample_name} ;
+        STAR \
+          --runThreadN {threads} \
+          --genomeDir $TOPDIR/{input.index} \
+          --readFilesIn $TOPDIR/{input.read} $TOPDIR/{input.mate} \
+          --readFilesCommand "zcat" \
+          --outFilterMultimapNmax 5 \
+          --outFilterMismatchNmax 5 \
+          --alignIntronMin 2 \
+          --alignIntronMax 1 \
+          --outSAMtype BAM Unsorted
+        '''
+
+
 rule sort_with_samtools:
     input:
-        'aligned_data/{sample_name}/Aligned.out.bam'
+        '{genome_or_spikein}aligned_data/{sample_name}/Aligned.out.bam'
     output:
-        'aligned_data/{sample_name}/Aligned.sorted.bam'
+        '{genome_or_spikein}aligned_data/{sample_name}/Aligned.sorted.bam'
     log:
-        'logs/{sample_name}.sortbam.log'
+        'logs/{genome_or_spikein}{sample_name}.sortbam.log'
     threads: 8
     shell:
         "samtools sort -m 2G -@ {threads} -o {output} {input}"
@@ -202,11 +258,11 @@ rule sort_with_samtools:
 
 rule index_with_samtools:
     input:
-        'aligned_data/{sample_name}/Aligned.sorted.bam'
+        '{genome_or_spikein}aligned_data/{sample_name}/Aligned.sorted.bam'
     output:
-        'aligned_data/{sample_name}/Aligned.sorted.bam.bai'
+        '{genome_or_spikein}aligned_data/{sample_name}/Aligned.sorted.bam.bai'
     log:
-        'logs/{sample_name}.indexbam.log'
+        'logs/{genome_or_spikein}{sample_name}.indexbam.log'
     threads: 1
     shell:
         "samtools index {input}"
@@ -214,11 +270,11 @@ rule index_with_samtools:
 
 rule stats_with_samtools:
     input:
-        'aligned_data/{sample_name}/Aligned.sorted.bam'
+        '{genome_or_spikein}aligned_data/{sample_name}/Aligned.sorted.bam'
     output:
-        'aligned_data/{sample_name}/Aligned.sorted.bamstats'
+        '{genome_or_spikein}aligned_data/{sample_name}/Aligned.sorted.bamstats'
     log:
-        'logs/{sample_name}.bamstats.log'
+        'logs/{genome_or_spikein}{sample_name}.bamstats.log'
     threads: 1
     shell:
         "samtools flagstat {input} > {output}"
@@ -321,6 +377,9 @@ rule run_edgeR:
           -tn {wildcards.treat_sample} \
           -o {output.tsv}
         '''
+
+
+####  DERFINDER ####
 
 
 rule split_strand:
@@ -428,6 +487,9 @@ rule merge_derfinder_strand:
         '''
         cat {input} | sort -k1,1 -k2,2n > {output}
         '''
+
+
+####  IGB XMLS  ####
 
 
 rule derfinder_to_igb_gtf:
@@ -541,4 +603,92 @@ rule combine_xml:
         '''
         python scripts/quickload/quickload.py merge \
           -o {output} {input}
+        '''
+
+
+####  DAPARS  ####
+
+rule unstranded_genomecov:
+    input:
+        bam='aligned_data/{sample_name}/Aligned.sorted.bam',
+        bai='aligned_data/{sample_name}/Aligned.sorted.bam.bai'
+    output:
+        'coverage_tracks/{sample_name}.unstranded.bedgraph',
+    params:
+        chrom_sizes=config['chrom_sizes'],
+    shell:
+        '''
+        bedtools genomecov -bg -split \
+          -ibam {input.bam} \
+          -g {params.chrom_sizes} > {output}
+        '''
+
+
+rule dapars_prep_annot:
+    output:
+        'dapars_annot.bed'
+    params:
+        bed12=config['flat_gene_bed12']
+    shell:
+        '''
+        awk -v OFS='\t' '{{print $4, $4}}' {params.bed12} > tx2gene_mapping.tsv
+        python scripts/dapars/src/DaPars_Extract_Anno.py \
+          -b {params.bed12} \
+          -s tx2gene_mapping.tsv \
+          -o dapars_annot.bed
+        '''
+
+
+def dapars_input(sample_name):
+    samples = set([
+        (s_name, s_id) for s_name, s_id in zip(SAMPLE_NAMES, SAMPLE_IDS)
+        if re.match(sample_name, s_name)
+    ])
+    sample_fns = [
+        'coverage_tracks/{}.{}.unstranded.bedgraph'.format(s_name, s_id) for s_name, s_id in samples
+    ]
+    return sample_fns
+
+
+rule run_dapars:
+    input:
+        cntrl=lambda wc: dapars_input(wc.cntrl_sample),
+        treat=lambda wc: dapars_input(wc.treat_sample),
+        annot='dapars_annot.bed'
+    output:
+        res='dapars/{treat_sample}_vs_{cntrl_sample}/{treat_sample}_vs_{cntrl_sample}_dapars_results.tsv',
+    params:
+        treat=lambda wc, input: ','.join(input.treat),
+        cntrl=lambda wc, input: ','.join(input.cntrl),
+        config=lambda wc: f'dapars/{wc.treat_sample}_vs_{wc.cntrl_sample}.config',
+    shell:
+        '''
+        cat <<EOF > {params.config}
+#The following file is the result of step 1.
+Annotated_3UTR={input.annot}
+
+#A comma-separated list of BedGraph files of samples from condition 1
+Group1_Tophat_aligned_Wig={params.treat}
+
+#A comma-separated list of BedGraph files of samples from condition 2
+Group2_Tophat_aligned_Wig={params.cntrl}
+
+Output_directory=dapars/{wildcards.treat_sample}_vs_{wildcards.cntrl_sample}/
+Output_result_file={wildcards.treat_sample}_vs_{wildcards.cntrl_sample}_dapars_results.tsv
+
+#At least how many samples passing the coverage threshold in two conditions
+Num_least_in_group1=1
+Num_least_in_group2=1
+
+Coverage_cutoff=30
+
+#Cutoff for FDR of P-values from Fisher exact test.
+
+FDR_cutoff=0.05
+PDUI_cutoff=0.5
+Fold_change_cutoff=0.59
+
+EOF
+
+        python scripts/dapars/src/DaPars_main.py {params.config}
         '''

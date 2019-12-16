@@ -1,0 +1,348 @@
+configfile: 'config.yml'
+
+import os
+import glob
+import re
+import itertools as it
+
+INPUT_FASTQ = glob.glob('raw_data/*/*.fastq.gz')
+SEQ_TYPES = [
+    os.path.split(os.path.split(fn)[0])[1] for fn in INPUT_FASTQ
+]
+SAMPLE_NAMES = [
+    os.path.split(re.sub('.fastq.gz$', '', fn))[1] for fn in INPUT_FASTQ
+]
+SAMPLES_BODY = [sn for sn, st in zip(SAMPLE_NAMES, SEQ_TYPES) if st == 'BODY']
+SAMPLES_5P = [sn for sn, st in zip(SAMPLE_NAMES, SEQ_TYPES) if st == '5P']
+
+rule all:
+    input:
+        'qc/multiqc_report.html',
+        expand(
+            ['aligned_data/{seq_type}/{sample_name}/Aligned.sorted.bam.bai'],
+            zip,
+            seq_type=SEQ_TYPES,
+            sample_name=SAMPLE_NAMES
+        ),
+        expand(
+            ['aligned_data/5P/{sample_name}/capped.sorted.bam.bai',
+             'aligned_data/5P/{sample_name}/uncapped.sorted.bam.bai',
+             'coverage_tracks/5P/{sample_name}.capped.5genomecov.bed',
+             'coverage_tracks/BODY/{sample_name}.matched_genomecov.bed'],
+            sample_name=SAMPLES_5P
+        ),
+        expand(
+            'coverage_tracks/5P/{sample_name}.{tag_type}capped.5{strand}_genomecov.bw',
+            sample_name=SAMPLES_5P + ['pooled'],
+            tag_type=['', 'un'],
+            strand=['fwd', 'rev'],
+        ),
+        expand(
+            ['coverage_tracks/BODY/{sample_name}.genomecov.bed'],
+            sample_name=SAMPLES_BODY
+        ),
+        'aligned_data/5P/pooled/uncapped.sorted.bam.bai',
+        'aligned_data/multiqc_report.html',
+        'peaks/final/nanoPARE_peaks.bed'
+
+
+rule fastqc:
+    input:
+        'raw_data/{seq_type}/{sample_name}.fastq.gz'
+    output:
+        'qc/{seq_type}/{sample_name}_fastqc.html',
+        'qc/{seq_type}/{sample_name}_fastqc.zip'
+    shell:
+        '''
+        fastqc -o qc/{wildcards.seq_type} {input}
+        '''
+
+
+rule fastqc_multiqc:
+    input:
+        expand(
+            'qc/{seq_type}/{sample_name}_fastqc.html',
+            zip,
+            seq_type=SEQ_TYPES,
+            sample_name=SAMPLE_NAMES
+        )
+    output:
+        'qc/multiqc_report.html'
+    shell:
+        '''
+        multiqc -f -dd 2 -o qc qc
+        '''
+        
+
+rule build_STAR_index:
+    '''Create the index required for alignment with STAR'''
+    output:
+        directory('STAR_index')
+    log:
+        'logs/STAR_idx.log'
+    threads: 24
+    params:
+        fasta_fn = config['genome'],
+        gtf_fn = config['gtf'],
+        overhang = 125
+    shell:
+        '''
+        mkdir {output};
+        STAR \
+          --runThreadN {threads} \
+          --runMode genomeGenerate \
+          --genomeDir {output} \
+          --genomeFastaFiles {params.fasta_fn} \
+          --sjdbGTFfile {params.gtf_fn} \
+          --sjdbOverhang {params.overhang}
+        '''
+
+
+rule map_with_STAR:
+    '''map reads with STAR spliced aligner'''
+    input:
+        read='raw_data/{seq_type}/{sample_name}.fastq.gz',
+        index='STAR_index'
+    output:
+        'aligned_data/{seq_type}/{sample_name}/Aligned.out.bam'
+    threads: 24
+    params:
+    shell:
+        '''
+        TOPDIR=$(pwd)
+        cd aligned_data/{wildcards.seq_type}/{wildcards.sample_name} ;
+        STAR \
+          --runThreadN {threads} \
+          --genomeDir $TOPDIR/{input.index} \
+          --readFilesIn $TOPDIR/{input.read} \
+          --readFilesCommand "zcat" \
+          --outFilterMultimapNmax 5 \
+          --alignSJoverhangMin 8 \
+          --alignSJDBoverhangMin 3 \
+          --outFilterMismatchNmax 5 \
+          --alignIntronMin 60 \
+          --alignIntronMax 10000 \
+          --outSAMtype BAM Unsorted
+        '''
+
+
+rule sort_with_samtools:
+    input:
+        'aligned_data/{seq_type}/{sample_name}/Aligned.out.bam'
+    output:
+        'aligned_data/{seq_type}/{sample_name}/Aligned.sorted.bam'
+    threads: 8
+    shell:
+        "samtools sort -m 2G -@ {threads} -o {output} {input}"
+        
+
+rule index_with_samtools:
+    input:
+        'aligned_data/{seq_type}/{sample_name}/Aligned.sorted.bam'
+    output:
+        'aligned_data/{seq_type}/{sample_name}/Aligned.sorted.bam.bai'
+    threads: 1
+    shell:
+        "samtools index {input}"
+
+
+rule stats_with_samtools:
+    input:
+        'aligned_data/{seq_type}/{sample_name}/Aligned.sorted.bam'
+    output:
+        'aligned_data/{seq_type}/{sample_name}/Aligned.sorted.bamstats'
+    threads: 1
+    shell:
+        "samtools flagstat {input} > {output}"
+
+
+rule mapping_multiqc:
+    input:
+        expand(
+            'aligned_data/{seq_type}/{sample_name}/Aligned.sorted.bamstats',
+            zip,
+            seq_type=SEQ_TYPES,
+            sample_name=SAMPLE_NAMES
+        )
+    output:
+        'aligned_data/multiqc_report.html'
+    shell:
+        '''
+        multiqc -f -dd 2 -o aligned_data aligned_data
+        '''
+
+
+rule filter_capped:
+    input:
+        bam='aligned_data/5P/{sample_name}/Aligned.sorted.bam',
+        bai='aligned_data/5P/{sample_name}/Aligned.sorted.bam.bai'
+    output:
+        capped='aligned_data/5P/{sample_name}/capped.sorted.bam',
+        cappedbai='aligned_data/5P/{sample_name}/capped.sorted.bam.bai',
+        uncapped='aligned_data/5P/{sample_name}/uncapped.sorted.bam',
+        uncappedbai='aligned_data/5P/{sample_name}/uncapped.sorted.bam.bai'
+    shell:
+        '''
+        python scripts/filter_capped.py -i {input.bam} -c {output.capped} -u {output.uncapped}
+        samtools index {output.capped}
+        samtools index {output.uncapped}
+        '''
+
+
+rule coverage_5P:
+    '''bedtools coverage of iCLIP data'''
+    input:
+        'aligned_data/5P/{sample_name}/{tag_type}capped.sorted.bam'
+    output:
+        fwd='coverage_tracks/5P/{sample_name}.{tag_type,(?:un)?}capped.5fwd_genomecov.bed',
+        rev='coverage_tracks/5P/{sample_name}.{tag_type,(?:un)?}capped.5rev_genomecov.bed',
+        both='coverage_tracks/5P/{sample_name}.{tag_type,(?:un)?}capped.5genomecov.bed'
+    threads: 1
+    shell:
+        '''
+        bedtools genomecov -5 -dz -strand + -ibam {input} |
+        awk -v OFS='\t' '{{print $1, $2, $2+1, "cov_5P", $3, "+"}}' \
+        > {output.fwd}
+
+        bedtools genomecov -5 -dz -strand - -ibam {input} |
+        awk -v OFS='\t' '{{print $1, $2, $2+1, "cov_5P", $3, "-"}}' \
+        > {output.rev}
+
+        cat {output.fwd} {output.rev} |
+        sort -k1,1 -k2,2n > {output.both}
+        '''
+
+
+rule bed_to_bw:
+    input:
+        'coverage_tracks/5P/{sample_name}.{tag_type}capped.5{strand}_genomecov.bed'
+    output:
+        'coverage_tracks/5P/{sample_name}.{tag_type,(?:un)?}capped.5{strand}_genomecov.bw'
+    params:
+        chrom_sizes=config['chrom_sizes']
+    shell:
+        '''
+        awk -v OFS='\t' '{{print $1, $2, $3, $5}}' {input} > {input}.tmp.bdg
+        bedGraphToBigWig {input}.tmp.bdg {params.chrom_sizes} {output}
+        rm {input}.tmp.bdg
+        '''
+
+
+rule coverage_BODY:
+    input:
+        bam='aligned_data/BODY/{sample_name}/Aligned.sorted.bam',
+        bai='aligned_data/BODY/{sample_name}/Aligned.sorted.bam.bai'
+    output:
+        'coverage_tracks/BODY/{sample_name}.genomecov.bed',
+    shell:
+        '''
+        samtools depth -d0 {input.bam} | 
+        awk -v OFS='\t' '{{print $1, $2-1, $2, "cov_BODY", $3, "+\\n" \\
+                                 $1, $2-1, $2, "cov_BODY", $3, "-"}}' > {output}
+        '''
+
+
+def get_matched_body_data(sample_name):
+    if sample_name == 'pooled':
+        return 'coverage_tracks/BODY/pooled.genomecov.bed'
+    else:
+        matched_sample = config['cntrl_pairs'][sample_name]
+        return f'coverage_tracks/BODY/{matched_sample}.genomecov.bed'
+
+
+rule map_input_to_iclip:
+    input:
+        cov_5p='coverage_tracks/5P/{sample_name,\w+}.capped.5genomecov.bed',
+        cov_body=lambda wc: get_matched_body_data(wc.sample_name),
+    output:
+        'coverage_tracks/BODY/{sample_name,\w+}.matched_genomecov.bed'
+    shell:
+        '''
+        bedtools map -s -o sum -c 5 -a {input.cov_5p} -b {input.cov_body} |
+        sed -e 's/\./0/' |
+        awk -v OFS='\t' '{{print $1, $2, $3, "cov_BODY", $7, $6}}' > {output}
+        '''
+
+
+rule peak_call_pirahna:
+    '''run piranha to identify 5P peaks'''
+    input:
+        cov_5p='coverage_tracks/5P/{sample_name}.capped.5genomecov.bed',
+        cov_body='coverage_tracks/BODY/{sample_name}.matched_genomecov.bed', 
+    output:
+        'peaks/initial/{sample_name}.peaks.bed'
+    threads: 1
+    shell:
+        '''
+        Piranha -s -o {output} -p 0.5 -u 0 -c {input.cov_5p} {input.cov_body}
+        awk -v OFS='\\t' '{{print $1, $2, $3, "peak", -log($7)/log(10), $6, $5, $7, $7, $2, "0", "0"}}' \
+          {output} > {output}.tmp
+        mv {output}.tmp {output}
+        '''
+
+
+rule run_idr:
+    input:
+        sample_a='peaks/initial/{sample_a}.peaks.bed',
+        sample_b='peaks/initial/{sample_b}.peaks.bed',
+    output:
+        'peaks/idr/{sample_a}_vs_{sample_b}.peaks.bed'
+    threads: 1
+    shell:
+        '''
+        idr --samples {input.sample_a} {input.sample_b} \
+          --input-file-type bed --rank score -i 0.1 --plot \
+          -o {output}
+        '''
+
+
+rule pool_5p:
+    input:
+        expand(
+            'aligned_data/5P/{sample_name}/{{tag_type}}capped.sorted.bam',
+            sample_name=SAMPLES_5P,
+        )
+    output:
+        bam='aligned_data/5P/pooled/{tag_type}capped.sorted.bam',
+        bai='aligned_data/5P/pooled/{tag_type}capped.sorted.bam.bai',
+    threads: 1
+    shell:
+        '''
+        samtools merge -r {output.bam} {input}
+        samtools index {output.bam}
+        '''
+
+
+rule pool_body:
+    input:
+        expand(
+            'aligned_data/BODY/{sample_name}/Aligned.sorted.bam',
+            sample_name=SAMPLES_BODY,
+        )
+    output:
+        bam='aligned_data/BODY/pooled/Aligned.sorted.bam',
+        bai='aligned_data/BODY/pooled/Aligned.sorted.bam.bai',
+    threads: 1
+    shell:
+        '''
+        samtools merge -r {output.bam} {input}
+        samtools index {output.bam}
+        '''
+
+
+rule toppeaks:
+    input:
+        oracle='peaks/initial/pooled.peaks.bed',
+        idr=[f'peaks/idr/{samp_a}_vs_{samp_b}.peaks.bed'
+             for samp_a, samp_b in it.combinations(SAMPLES_5P, r=2)]
+    output:
+        count='peaks/final/nanoPARE_peak.count',
+        peaks='peaks/final/nanoPARE_peaks.bed'
+    threads: 1
+    shell:
+        '''
+        set +o pipefail # not sure what the command causing this requirement is but the output appears correct
+        MINPEAKS=$(wc -l {input.idr} | grep -v total | awk '{{print $1}}' | sort -k1,1n | head -n1)
+        echo "using top $MINPEAKS peaks" > {output.count}
+        sort -k5,5gr {input.oracle} | head -n $MINPEAKS | sort -k1,1 -k2,2n > {output.peaks}
+        '''

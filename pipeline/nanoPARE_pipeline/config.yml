@@ -1,0 +1,13 @@
+basedir: raw_data
+
+cntrl_pairs:
+  SRR6967096: SRR6967078
+  SRR6967097: SRR6967079
+  SRR6967098: SRR6967080
+
+genome: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa
+chrom_sizes: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.chrom.sizes
+gtf: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/TAIR10/ensembl/release_35/Arabidopsis_thaliana.TAIR10.35.gtf
+transcriptome: 
+  - /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_genes.201606.cdna.fasta
+  - /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_non_coding.201606.cdna.fasta

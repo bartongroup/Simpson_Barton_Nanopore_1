@@ -1,0 +1,9 @@
+miRNA_tsv: /cluster/ggs_lab/mtparker/analysis_notebooks/nanopore_cleavage_products/nanoPARE/EndCut.pipeline/resources/Ath_annotations/anno.miRNA.tsv
+tasiRNA_tsv: /cluster/ggs_lab/mtparker/analysis_notebooks/nanopore_cleavage_products/nanoPARE/EndCut.pipeline/resources/Ath_annotations/anno.tasiRNA.tsv
+transcriptome: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_genes.201606.cdna.fasta
+annotation_bed12: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_prot_coding_and_non_coding.bed
+annotation_gff: /cluster/ggs_lab/mtparker/Arabidopsis_annotations/Araport/v11/201606/Araport11_GFF3_genes_transposons.201606.no_chr.gff
+bigwigs:
+    fwd: /cluster/ggs_lab/mtparker/pooled_DRS_bws/col0_fwd.5prime.bw
+    rev: /cluster/ggs_lab/mtparker/pooled_DRS_bws/col0_rev.5prime.bw
+n_shuffles: 1000
