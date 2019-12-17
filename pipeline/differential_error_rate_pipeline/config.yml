@@ -5,18 +5,18 @@ data_root: /cluster/ggs_lab/mtparker/DER_m6a_pipeline
 comparison: vir1_vs_VIRc
 make_quickload: True
 
-# cond a will be used for poly_a analysis
 cond_a_sample_names:
+  - 201902_vir1_2923
+  - 201902_vir1_2924
+  - 201902_vir1_2925
+  - 20190317_vir1_2922
+
+cond_b_sample_names:
   - 201902_VIRcompl_2929
   - 201812_VIRcomp_2930
   - 201812_VIRcompl_2931
   - 20190317_VIRc_2928
 
-cond_b_sample_names:
-  - 201902_vir1_2923
-  - 201902_vir1_2924
-  - 201902_vir1_2925
-  - 20190317_vir1_2922
 
 #---------------------------#
 # REFERENCE SETTINGS #
